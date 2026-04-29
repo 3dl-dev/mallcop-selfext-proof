@@ -404,13 +404,20 @@ max_iters = 5
   binary = "{{TOOL_BIN_DIR}}/mallcop-investigate-tools"
   binary_args = ["--tool", "approve-action"]
 
-# task:heal capability seed — F1H: parser-fix actor (log_format_drift only)
+# task:heal capability seed — broadened (mallcoppro-861/heal-broaden epic).
+#
+# Heal handles 7 finding classes (log_format_drift, detector_gap,
+# capability_seed_drift, agent_blind_spot, chart_config_drift,
+# connector_field_miss, post_md_systemic_gap) by spawning Claude Code via
+# spawn-claude-code-fix to author a draft PR upstream. Heal does NOT merge,
+# does NOT retry, does NOT operate on legion or mallcop-pro repos. See
+# docs/design/heal-broaden.md and agents/heal/POST.md for the procedure.
 [[capabilities.seed]]
 name      = "heal"
 match     = ["task:heal"]
-tools     = ["read-finding", "annotate-finding", "resolve-finding"]
+tools     = ["read-finding", "annotate-finding", "resolve-finding", "spawn-claude-code-fix"]
 model     = "{{MODEL}}"
-max_iters = 5
+max_iters = 3
 
   [[capabilities.seed.tool_defs]]
   name = "read-finding"
@@ -421,17 +428,24 @@ max_iters = 5
 
   [[capabilities.seed.tool_defs]]
   name = "annotate-finding"
-  description = "Add finding:annotation tagged note to engagement campfire. Use to store the parser.yaml patch JSON as annotation text."
+  description = "Add finding:annotation tagged note to engagement campfire. Use to record the heal attempt outcome (PR url on success, failure reason otherwise)."
   input_schema = '{"type":"object","required":["finding_id","note"],"properties":{"finding_id":{"type":"string"},"note":{"type":"string","maxLength":4096},"tags":{"type":"array","items":{"type":"string"}}}}'
   binary = "{{TOOL_BIN_DIR}}/mallcop-investigate-tools"
   binary_args = ["--tool", "annotate-finding"]
 
   [[capabilities.seed.tool_defs]]
   name = "resolve-finding"
-  description = "Close a finding with a resolution action. Use action=\"resolved\" after annotating with the parser patch proposal."
+  description = "Close a finding with a resolution action. Use action=\"resolved\" with confidence<=4 on PR-proposed (human still needs to merge); action=\"escalated\" with low confidence on heal-attempt failure."
   input_schema = '{"type":"object","required":["finding_id","action","reason"],"properties":{"finding_id":{"type":"string"},"action":{"type":"string","enum":["resolved","escalated","remediated"]},"reason":{"type":"string"},"confidence":{"type":"number","minimum":1,"maximum":5}}}'
   binary = "{{TOOL_BIN_DIR}}/mallcop-investigate-tools"
   binary_args = ["--tool", "resolve-finding"]
+
+  [[capabilities.seed.tool_defs]]
+  name = "spawn-claude-code-fix"
+  description = "Spawn Claude Code in a fresh worktree of an allowlisted repo to attempt a fix for the finding. Single-shot (no retry); produces a draft PR upstream on success or a structured failure reason. Allowlist + budget gate are enforced in the binary; agent cannot bypass."
+  input_schema = '{"type":"object","required":["finding_class","repo_alias","problem_description","success_test_command","branch_name_suffix"],"properties":{"finding_class":{"type":"string","enum":["log_format_drift","detector_gap","capability_seed_drift","agent_blind_spot","chart_config_drift","connector_field_miss","post_md_systemic_gap"]},"repo_alias":{"type":"string","description":"alias from heal allowlist (mallcop, mallcop-legion-prompts, ...)"},"problem_description":{"type":"string","description":"tight problem statement: failing input + expected output + suspected file(s)"},"success_test_command":{"type":"string","description":"shell command that exits 0 iff the fix works"},"branch_name_suffix":{"type":"string","description":"suffix for branch name; full branch is work/heal-<finding_class>-<suffix>"}}}'
+  binary = "{{TOOL_BIN_DIR}}/mallcop-investigate-tools"
+  binary_args = ["--tool", "spawn-claude-code-fix"]
 
 [lifecycle]
 max_workers   = 4                    # operational pipeline: parallel triage + investigate workers
