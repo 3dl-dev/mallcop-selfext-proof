@@ -1,3 +1,5 @@
+github.com/3dl-dev/mallcop-pro v0.1.1 h1:7tuQmmxFEtC40hM5Rxfb2vRt57MJL+LySetA35vcq3o=
+github.com/3dl-dev/mallcop-pro v0.1.1/go.mod h1:pJYpuc0dvZu1JuiE0/U9qa3TJ5h9YaqZLRw0IYG1m4U=
 github.com/Azure/azure-sdk-for-go/sdk/azcore v1.20.0 h1:JXg2dwJUmPB9JmtVmdEB16APJ7jurfbY5jnfXpJoRMc=
 github.com/Azure/azure-sdk-for-go/sdk/azcore v1.20.0/go.mod h1:YD5h/ldMsG0XiIw7PdyNhLxaM317eFh5yNLccNfGdyw=
 github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.13.1 h1:Hk5QBxZQC1jb2Fwj6mpzme37xbCDdNTxU7O9eb5+LB4=

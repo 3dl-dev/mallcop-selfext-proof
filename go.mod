@@ -3,9 +3,9 @@ module github.com/thirdiv/mallcop-legion
 go 1.25.0
 
 require (
+	github.com/3dl-dev/mallcop-pro v0.1.1
 	github.com/BurntSushi/toml v1.6.0
 	github.com/campfire-net/campfire v0.17.5
-	github.com/thirdiv/mallcop-pro v0.0.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -28,5 +28,3 @@ require (
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 )
-
-replace github.com/thirdiv/mallcop-pro => /home/baron/projects/mallcop-pro

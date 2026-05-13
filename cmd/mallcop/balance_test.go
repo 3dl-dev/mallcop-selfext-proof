@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/thirdiv/mallcop-pro/testutil"
+	"github.com/3dl-dev/mallcop-pro/testutil"
 )
 
 // captureStdout redirects os.Stdout to a buffer, runs f, and returns the output.
