@@ -338,6 +338,16 @@ func runResolveFinding(inputJSON string) error {
 		return fmt.Errorf("resolve-finding: %w", err)
 	}
 
+	// Mirror the terminal signal to the work campfire when it differs from
+	// the engagement campfire (legion v0.8.2+ sets MALLCOP_CAMPFIRE_ID to
+	// the per-item engagement campfire, while academy watches the work
+	// campfire for terminal events). When the two collapse to the same
+	// campfire (operational fallback in activate), this is a no-op via
+	// the early-return inside the helper.
+	if workCampfireID := os.Getenv("MALLCOP_WORK_CAMPFIRE_ID"); workCampfireID != "" && workCampfireID != campfireID {
+		emitScenarioTerminalWorkOutput(workCampfireID, input.FindingID, input.Action, input.Reason, os.Getenv("MALLCOP_ITEM_ID"))
+	}
+
 	return emitJSON(map[string]interface{}{
 		"finding_id": input.FindingID,
 		"action":     input.Action,
@@ -445,6 +455,52 @@ func cfWorkCreate(workCampfireID, skill, title, context string) (string, error) 
 	return itemID, nil
 }
 
+// emitScenarioTerminalWorkOutput posts a work:output to the work campfire
+// announcing the originating worker's terminal verdict on a finding. This is
+// the message mallcop-academy watches for as proof-of-resolution: the
+// work:output carries finding:<id> and action:<verb> tags so academy can
+// match it back to the scenario it spawned.
+//
+// Chain-handoff tools (escalate-to-investigator, escalate-to-stage-c,
+// escalate-to-deep) call this after cfWorkCreate so the originating
+// scenario gets a deterministic terminal even though the chain itself
+// continues downstream. Without this, the originating triage/investigate
+// worker exits with only a generic "automaton-manager: worker completed"
+// close — no scenario tag, no action tag — and the bakeoff academy never
+// observes the scenario as terminal.
+//
+// Best-effort: campfire-post failures are logged but not surfaced as
+// tool errors. The chain item has already been created; the missing
+// terminal signal is a grading-visibility issue, not a workflow blocker.
+func emitScenarioTerminalWorkOutput(workCampfireID, findingID, action, summary, parentItemID string) {
+	if workCampfireID == "" || findingID == "" || action == "" {
+		return
+	}
+	payload := map[string]interface{}{
+		"finding_id": findingID,
+		"action":     action,
+		"reason":     summary,
+		"timestamp":  nowRFC3339(),
+	}
+	if parentItemID != "" {
+		payload["item_id"] = parentItemID
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "terminal work:output marshal: %v\n", err)
+		return
+	}
+	tags := []string{
+		"work:output",
+		"gate:checked",
+		"finding:" + findingID,
+		"action:" + action,
+	}
+	if _, sendErr := cfSend(workCampfireID, string(body), tags); sendErr != nil {
+		fmt.Fprintf(os.Stderr, "terminal work:output send: %v\n", sendErr)
+	}
+}
+
 // escalateToInvestigatorInput is the input_schema for escalate-to-investigator.
 type escalateToInvestigatorInput struct {
 	FindingID  string  `json:"finding_id"`
@@ -480,6 +536,13 @@ func runEscalateToInvestigator(inputJSON string) error {
 	if err != nil {
 		return fmt.Errorf("escalate-to-investigator: %w", err)
 	}
+
+	// Terminal signal for the originating worker — academy needs this to
+	// observe the scenario as resolved-by-escalation. Without it the only
+	// close on the wire is automaton-manager's generic "worker completed"
+	// which carries no finding/scenario tag, and the bakeoff never grades
+	// non-hard-constraint scenarios as terminal.
+	emitScenarioTerminalWorkOutput(workCampfireID, input.FindingID, "escalated", input.Reason, parentItemID)
 
 	return emitJSON(map[string]interface{}{
 		"item_id":    itemID,
@@ -533,6 +596,9 @@ func runEscalateToStageC(inputJSON string) error {
 	if err != nil {
 		return fmt.Errorf("escalate-to-stage-c: %w", err)
 	}
+
+	// Terminal signal for academy — see emitScenarioTerminalWorkOutput.
+	emitScenarioTerminalWorkOutput(workCampfireID, input.FindingID, "escalated", input.Reason, parentItemID)
 
 	return emitJSON(map[string]interface{}{
 		"item_id":      itemID,
