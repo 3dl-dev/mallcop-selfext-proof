@@ -1277,7 +1277,7 @@ func TestWatchLoop_TimeWindowFilter(t *testing.T) {
 	afterWindowTs := now.Add(2 * time.Hour).UnixNano()   // 2h after  — outside window (> deadline+5s)
 
 	// In-window work:create (chain extension for a hypothetical escalation step).
-	// References "in-window-chain-id" as its id. Should be processed by the
+	// References "mock-msg-1" as its id. Should be processed by the
 	// work:create map-building loop and registered.
 	inWindowCreatePayload, _ := json.Marshal(map[string]interface{}{
 		"id":    "mock-msg-1", // same id as the posted scenario — extends chain
@@ -1378,6 +1378,9 @@ func TestWatchLoop_TimeWindowFilter(t *testing.T) {
 	}
 	if rec.TerminalAt == nil {
 		t.Error("TW-01 terminal_at must not be nil — in-window close must mark terminal")
+	}
+	if rec.TerminalItemID == "" {
+		t.Error("terminal_item_id must be populated when in-window close arrives")
 	}
 
 	// Out-of-window item IDs must NOT appear in full_chain.
