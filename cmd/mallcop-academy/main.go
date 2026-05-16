@@ -27,12 +27,16 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/mallcop-app/mallcop/internal/exam"
@@ -43,9 +47,10 @@ import (
 // cfMessage is a partial unmarshal of the JSON returned by `cf send --json` or
 // one line from `cf read --json --all`.
 type cfMessage struct {
-	ID      string   `json:"id"`
-	Tags    []string `json:"tags"`
-	Payload string   `json:"payload"`
+	ID        string   `json:"id"`
+	Tags      []string `json:"tags"`
+	Payload   string   `json:"payload"`
+	Timestamp int64    `json:"timestamp"` // Unix nanoseconds; 0 when not present (legacy)
 }
 
 // cfSender shells out to the cf binary to send messages and returns the
@@ -206,6 +211,11 @@ type trackedScenario struct {
 	mu             sync.Mutex
 	scenarioID     string
 	findingID      string
+	// altFindingID is the findingTrackingID (academy-<runID>-<scenarioID>) used as a
+	// secondary attribution key. Workers that use the triage→investigate escalation
+	// path embed this exact value as the finding_id. Matched with strict equality only
+	// — no suffix extraction (mallcoppro-4dc). See matchesFindingTag.
+	altFindingID   string
 	workItemID     string // cf message ID of the work:create
 	postedAt       time.Time
 	chain          []ChainEntry
@@ -220,9 +230,23 @@ type trackedScenario struct {
 	toolsUsedInInvest   bool   // true if any investigate step had tool calls
 	maxInvestIterations int    // highest iteration count seen across investigate workers
 
+	// Campfire-sourced usage (mallcoppro-237 A2): accumulated from tool-usage
+	// tagged messages posted by resolve-finding / escalate-to-investigator /
+	// escalate-to-stage-c on the work campfire. Matched by finding_id during
+	// the watch loop. Non-zero when at least one terminal tool call was observed.
+	toolUsageCalls     int   // sum of forge_calls fields across tool-usage messages
+	toolUsageTokensIn  int64 // sum of tokens_in fields
+	toolUsageTokensOut int64 // sum of tokens_out fields
+
+	// seenToolUsageMsgs deduplicates tool-usage campfire messages by message ID.
+	// cf readAll re-delivers the entire message history on every poll iteration,
+	// so without dedup the same tool-usage message is counted once per poll.
+	// (mallcoppro-5119)
+	seenToolUsageMsgs map[string]bool
+
 	// F4B/F4C wiring — set after judge runs (single-pass write).
-	scenario        interface{} // *exam.Scenario, stored as interface{} to avoid circular import issues
-	judgeResult     *JudgeResult
+	scenario    interface{} // *exam.Scenario, stored as interface{} to avoid circular import issues
+	judgeResult *JudgeResult
 }
 
 // ---- Close payload parsing ----------------------------------------------------
@@ -476,28 +500,93 @@ func academy(sender Sender, args runArgs) error {
 	// Also build workItemID → *trackedScenario for watch-loop lookups.
 	tracked := make(map[string]*trackedScenario, len(scenarios))
 	for _, s := range scenarios {
-		// findingID is the actual finding ID from the scenario (e.g. "fnd_shk_005").
-		// This is the ID that workers use when calling resolve-finding and annotate-finding,
-		// allowing us to match work:output messages back to their scenario by finding_id.
-		// Also keep the tracking ID for backward-compat lookups.
-		actualFindingID := s.Finding.ID
-		if actualFindingID == "" {
+		// findingID is the per-run-unique finding ID derived from the scenario's
+		// base finding ID and the run ID. Suffixing with _<runID> ensures that
+		// two bakeoff runs that share the same YAML finding ID (e.g. "fnd_shk_005")
+		// produce distinct tracked.findingID values, preventing a work:output with
+		// finding:<bare-id> from matching scenarios across runs (mallcoppro-73b).
+		//
+		// The suffixed ID is also carried into the work:create payload (finding.id)
+		// so workers call resolve-finding with the suffixed form, ensuring the
+		// finding:<id> tag on work:output is likewise suffixed and unambiguous.
+		var actualFindingID string
+		if s.Finding.ID != "" {
+			actualFindingID = perRunFindingID(s.Finding.ID, args.runID)
+		} else {
 			actualFindingID = findingTrackingID(args.runID, s.ID)
 		}
+		// altFindingID is the findingTrackingID (academy-<runID>-<scenarioID>).
+		// altFindingID is the findingTrackingID (academy-<runID>-<scenarioID>).
+		// Triage workers that call escalate-to-investigator embed this exact form as
+		// the finding_id in their work:create payload. Matched with strict equality
+		// (mallcoppro-4dc). With timestamp run-IDs, the altFindingID is unique per
+		// run, so stale messages from a prior run cannot match.
+		altFindingID := findingTrackingID(args.runID, s.ID)
 		ts := &trackedScenario{
-			scenarioID: s.ID,
-			findingID:  actualFindingID,
-			scenario:   s, // stored for F4B grading
+			scenarioID:        s.ID,
+			findingID:         actualFindingID,
+			altFindingID:      altFindingID,
+			seenToolUsageMsgs: make(map[string]bool),
+			scenario:          s, // stored for F4B grading
 		}
 		tracked[s.ID] = ts
 	}
 
+	// SIGTERM handler (mallcoppro-627): when the parent process kills us (e.g.
+	// bakeoff harness timeout), flush partial records for all posted-but-non-terminal
+	// scenarios so the run produces JSON output rather than silence.
+	//
+	// The handler uses the same partial-flush logic as the watch-loop timeout path.
+	// shuttingDown is checked in the watch loop to suppress redundant flushes.
+	var shuttingDown atomic.Bool
+	// postMu guards workItemToScenario, runPostedAtMin, and the partial-flush
+	// in the SIGTERM handler. Declared here (before the SIGTERM goroutine) so
+	// the closure can reference it.
+	var postMu sync.Mutex
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM)
+	go func() {
+		_, ok := <-sigCh
+		if !ok {
+			return
+		}
+		if !shuttingDown.CompareAndSwap(false, true) {
+			return // already shutting down
+		}
+		fmt.Fprintf(os.Stderr, "WARN: SIGTERM received — flushing partial scenario records\n")
+		postMu.Lock()
+		for _, ts := range tracked {
+			ts.mu.Lock()
+			posted := ts.workItemID != ""
+			terminal := ts.terminal
+			ts.mu.Unlock()
+			if posted && !terminal {
+				if err := writeScenarioRecord(ts, args.runID, args.targetCampfire, args.outputDir, args.usage); err != nil {
+					fmt.Fprintf(os.Stderr, "WARN: SIGTERM flush: write partial record for %s: %v\n", ts.scenarioID, err)
+				}
+			}
+		}
+		postMu.Unlock()
+		os.Exit(0)
+	}()
+	defer func() {
+		signal.Stop(sigCh)
+		close(sigCh)
+	}()
+
 	// Post work:create messages, respecting max-concurrent.
 	sem := make(chan struct{}, args.maxConcurrent)
 	var postWG sync.WaitGroup
-	var postMu sync.Mutex
 	// workItemToScenario maps cf message ID → scenario ID.
 	workItemToScenario := make(map[string]string)
+
+	// runPostedAtMin is the Unix-nanosecond timestamp of the FIRST successfully
+	// posted scenario. Set once (guarded by postMu) in the post goroutine.
+	// Used to bound the watch-loop time window: messages outside
+	// [runPostedAtMin - 5s, runDeadline + 5s] are skipped before classification.
+	// Zero until the first scenario is posted.
+	var runPostedAtMin int64
 
 	for _, s := range scenarios {
 		postWG.Add(1)
@@ -561,6 +650,12 @@ func academy(sender Sender, args runArgs) error {
 
 			postMu.Lock()
 			workItemToScenario[msgID] = s.ID
+			// Record the earliest posted-at timestamp as the run window floor.
+			// Use the local clock captured in postFinding (before sender.send).
+			postedAtNs := postedAt.UnixNano()
+			if runPostedAtMin == 0 || postedAtNs < runPostedAtMin {
+				runPostedAtMin = postedAtNs
+			}
 			postMu.Unlock()
 
 			fmt.Fprintf(os.Stderr, "posted scenario %s → cf message %s\n", s.ID, msgID)
@@ -578,6 +673,25 @@ func academy(sender Sender, args runArgs) error {
 			fmt.Fprintf(os.Stderr, "WARN: read campfire: %v\n", err)
 		}
 
+		// Compute time-window bounds for this poll iteration.
+		// Defense-in-depth: messages outside [runPostedAtMin-5s, runDeadline+5s]
+		// are skipped before classification to prevent cross-run message pickup (mallcoppro-f6b).
+		// When runPostedAtMin is zero (no scenario posted yet), the window is not applied.
+		// A message with Timestamp==0 also passes through (pre-timestamp cf versions).
+		postMu.Lock()
+		iterWindowFloor := runPostedAtMin
+		iterWindowCeil := runPostedAtMin + args.timeout.Nanoseconds()
+		postMu.Unlock()
+		const msgWindowSlackNs = int64(5 * time.Second)
+
+		inRunWindow := func(msg cfMessage) bool {
+			if iterWindowFloor == 0 || msg.Timestamp == 0 {
+				return true
+			}
+			return msg.Timestamp >= iterWindowFloor-msgWindowSlackNs &&
+				msg.Timestamp <= iterWindowCeil+msgWindowSlackNs
+		}
+
 		// Build a fresh workItemToScenario map including any new chain items
 		// (work:create from escalations) before processing closes.
 		// For each work:create that chains from a known scenario item, register
@@ -585,6 +699,12 @@ func academy(sender Sender, args runArgs) error {
 		postMu.Lock()
 		for _, msg := range msgs {
 			if !hasTag(msg.Tags, "work:create") {
+				continue
+			}
+			// Time-window guard: skip out-of-window work:create messages.
+			if !inRunWindow(msg) {
+				slog.Debug("academy: skipping out-of-window work:create",
+					"msg_id", msg.ID, "msg_ts_ns", msg.Timestamp)
 				continue
 			}
 			// Parse work:create payload: look for "id" field (cfWorkCreate format).
@@ -601,40 +721,87 @@ func academy(sender Sender, args runArgs) error {
 				workCreateID = p.ItemID
 			}
 
-			// Map both the campfire message ID and the work item ID to the scenario.
-			// Strategy: the work:create is a chain item if it was preceded by a
-			// work:claim for the original scenario item. We check if ANY tracked
-			// scenario has this msg ID already tracked (e.g. via the initial posting),
-			// or if the context references a known scenario item ID.
-			for scenID, tsRef := range tracked {
-				tsRef.mu.Lock()
-				alreadyKnown := false
-				for _, ce := range tsRef.chain {
-					if ce.ItemID == msg.ID || ce.ItemID == workCreateID {
-						alreadyKnown = true
-						break
-					}
-				}
-				if !alreadyKnown && (workItemToScenario[msg.ID] == scenID) {
-					alreadyKnown = true
-				}
-				tsRef.mu.Unlock()
-				_ = alreadyKnown
-			}
-			// Register message ID → scenario for any scenario that owns the
-			// immediately-preceding item in the chain (heuristic: register under
-			// ALL tracked scenarios if it's the only one, or match by context).
+			// Register message ID → scenario only if the work:create has a real
+			// chain link: either msg.ID is already known (registered at post time),
+			// or workCreateID appears as an antecedent in some scenario's chain.
+			// The prior "first non-terminal" fallback is removed — assigning unknown
+			// work:create messages to an arbitrary scenario caused mis-attribution
+			// when multiple scenarios are tracked concurrently (mallcoppro-647).
 			if workCreateID != "" {
 				if _, known := workItemToScenario[workCreateID]; !known {
-					// Default: assign to the first scenario that hasn't reached terminal.
-					for scenIDKey, tsRef := range tracked {
-						tsRef.mu.Lock()
-						isTerminal := tsRef.terminal
-						tsRef.mu.Unlock()
-						if !isTerminal {
-							workItemToScenario[workCreateID] = scenIDKey
-							workItemToScenario[msg.ID] = scenIDKey
-							break
+					// Check if msg.ID is already mapped (e.g. posted by academy's own sender).
+					if scenIDKey, msgKnown := workItemToScenario[msg.ID]; msgKnown {
+						workItemToScenario[workCreateID] = scenIDKey
+					} else {
+						// Walk chains: assign only if workCreateID is an antecedent
+						// already present in a scenario's chain (real chain link).
+						for scenIDKey, tsRef := range tracked {
+							tsRef.mu.Lock()
+							var chainMatch bool
+							for _, ce := range tsRef.chain {
+								if ce.ItemID == workCreateID {
+									chainMatch = true
+									break
+								}
+							}
+							tsRef.mu.Unlock()
+							if chainMatch {
+								workItemToScenario[workCreateID] = scenIDKey
+								workItemToScenario[msg.ID] = scenIDKey
+								break
+							}
+						}
+						// No chain link found. Before giving up, try tag-based attribution
+						// (mallcoppro-60e, mallcoppro-c33): triage workers emit investigate
+						// work:create items with fresh rd item IDs (not cf-msg-UUIDs), so
+						// they never appear in any scenario's chain. Those messages carry a
+						// finding:<id> tag scoping them to a specific scenario. If we find
+						// such a tag and it matches a tracked scenario (primary or via
+						// scenarioID suffix extraction), attribute it via that tag. This
+						// preserves the original 647 guard (messages with no finding tag
+						// are still rejected).
+						if _, nowKnown := workItemToScenario[workCreateID]; !nowKnown {
+							var tagFindingID string
+							for _, tag := range msg.Tags {
+								if strings.HasPrefix(tag, "finding:") {
+									tagFindingID = strings.TrimPrefix(tag, "finding:")
+									break
+								}
+							}
+							if tagFindingID != "" {
+								for scenIDKey, tsRef := range tracked {
+									tsRef.mu.Lock()
+									// Defense-in-depth (mallcoppro-0f9): never attribute
+									// a work:create to a scenario whose post failed.
+									// An unposted scenario has no real worker; any
+									// matching tag is a ghost from a prior bakeoff run.
+									if tsRef.workItemID == "" {
+										tsRef.mu.Unlock()
+										continue
+									}
+									match := matchesFindingTag(tsRef, tagFindingID)
+									tsRef.mu.Unlock()
+									if match {
+										workItemToScenario[workCreateID] = scenIDKey
+										workItemToScenario[msg.ID] = scenIDKey
+										slog.Debug("academy: work:create attributed via finding tag",
+											"msg_id", msg.ID,
+											"work_create_id", workCreateID,
+											"finding_id", tagFindingID,
+											"scenario_id", scenIDKey,
+										)
+										break
+									}
+								}
+							}
+						}
+						// No chain link and no scoping finding tag — log and skip.
+						// Do not assign to an arbitrary scenario (the original 647 guard).
+						if _, nowKnown := workItemToScenario[workCreateID]; !nowKnown {
+							slog.Info("academy: work:create with no known chain antecedent — skipping assignment",
+								"msg_id", msg.ID,
+								"work_create_id", workCreateID,
+							)
 						}
 					}
 				}
@@ -642,7 +809,31 @@ func academy(sender Sender, args runArgs) error {
 		}
 		postMu.Unlock()
 
+		// Pre-pass: accumulate ALL tool-usage messages in the batch BEFORE processing
+		// any work:close/work:output messages. This ensures forge_calls is populated
+		// before writeScenarioRecord is triggered, regardless of the order in which
+		// the campfire delivers tool-usage vs. terminal-close messages (mallcoppro-b87,
+		// mallcoppro-632). Tool-usage is tied to the run by finding_id tag, not by
+		// timestamp, so it is exempt from the inRunWindow guard.
 		for _, msg := range msgs {
+			if hasTag(msg.Tags, "tool-usage") {
+				accumulateToolUsage(msg, tracked)
+			}
+		}
+
+		for _, msg := range msgs {
+			// Time-window guard: skip messages outside the run's active window.
+			// Defense-in-depth on top of the tag-based and chain-link filtering (mallcoppro-f6b).
+			if !inRunWindow(msg) {
+				slog.Debug("academy: skipping out-of-window message",
+					"msg_id", msg.ID,
+					"msg_ts_ns", msg.Timestamp,
+					"window_floor_ns", iterWindowFloor-msgWindowSlackNs,
+					"window_ceil_ns", iterWindowCeil+msgWindowSlackNs,
+				)
+				continue
+			}
+
 			// Accept both work:close and work:output messages.
 			// work:close is posted by we automaton-manager (resolution:done always).
 			// work:output with action:* tag is posted by resolve-finding tool with
@@ -699,11 +890,17 @@ func academy(sender Sender, args runArgs) error {
 						foundFindingID = payloadFindingID.FindingID
 					}
 				}
-				// Match against tracked scenario finding IDs.
+				// Match against tracked scenario finding IDs (primary + scenario-ID suffix).
 				if foundFindingID != "" {
 					for scenIDKey, tsRef := range tracked {
 						tsRef.mu.Lock()
-						match := tsRef.findingID == foundFindingID
+						// Defense-in-depth (mallcoppro-0f9): never attribute a
+						// work:close/output to a scenario whose post failed.
+						if tsRef.workItemID == "" {
+							tsRef.mu.Unlock()
+							continue
+						}
+						match := matchesFindingTag(tsRef, foundFindingID)
 						tsRef.mu.Unlock()
 						if match {
 							ok = true
@@ -853,8 +1050,19 @@ func academy(sender Sender, args runArgs) error {
 func postFinding(sender Sender, s *exam.Scenario, runID, campfireID string) (string, time.Time, error) {
 	fid := findingTrackingID(runID, s.ID)
 
+	// Use the per-run-unique finding ID in the payload so workers call
+	// resolve-finding with the suffixed form. This ensures the finding:<id>
+	// tag on any work:output is likewise suffixed, making cross-run collision
+	// impossible. If the base finding ID is empty, fall back to the tracking ID.
+	var payloadFindingID string
+	if s.Finding.ID != "" {
+		payloadFindingID = perRunFindingID(s.Finding.ID, runID)
+	} else {
+		payloadFindingID = fid
+	}
+
 	fp := findingPayload{
-		ID:       s.Finding.ID,
+		ID:       payloadFindingID,
 		Detector: s.Finding.Detector,
 		Title:    s.Finding.Title,
 		Severity: s.Finding.Severity,
@@ -900,6 +1108,18 @@ func findingTrackingID(runID, scenarioID string) string {
 	return "academy-" + runID + "-" + scenarioID
 }
 
+// perRunFindingID returns a per-run-unique finding ID by suffixing the base
+// finding ID with the run ID: <base>_<runID>. This prevents cross-run
+// finding-ID collisions when multiple bakeoff runs share the same YAML
+// scenario file (and therefore the same s.Finding.ID). Allowed characters in
+// the suffix are alphanumeric plus '-' and '_'; a runID like "bk-lane1" is
+// safe. The base is the original finding ID from the scenario YAML (e.g.
+// "fnd_shk_005"). The suffixed form is used in tracked.findingID AND in the
+// work:create finding.id payload so workers call resolve-finding with it.
+func perRunFindingID(baseFindingID, runID string) string {
+	return baseFindingID + "_" + runID
+}
+
 // filterAcademyMetadata passes through finding metadata for academy use.
 // For now we pass through all metadata fields since the academy is posting
 // to its own isolated campfire and ground-truth filtering is the exam-seed's
@@ -926,6 +1146,125 @@ func isTriageSkill(skill string) bool {
 func isInvestigateSkill(skill string) bool {
 	return skill == "task:investigate" || skill == "task:deep-investigate" ||
 		skill == "task:investigate-merge"
+}
+
+// ---- Tool-usage accumulation (mallcoppro-237 A2) --------------------------------
+
+// toolUsagePayload is the JSON payload shape of a tool-usage message posted by
+// resolve-finding / escalate-to-investigator / escalate-to-stage-c.
+type toolUsagePayload struct {
+	ForgeCalls int    `json:"forge_calls"`
+	TokensIn   int64  `json:"tokens_in"`
+	TokensOut  int64  `json:"tokens_out"`
+	FindingID  string `json:"finding_id"`
+	ItemID     string `json:"item_id"`
+}
+
+// accumulateToolUsage processes a tool-usage tagged campfire message and adds
+// its forge_calls/tokens_in/tokens_out to the matching scenario's accumulators.
+// Matching is done via finding_id tag (finding:<id>) or the payload finding_id field.
+// Called from the watch loop for every message tagged tool-usage.
+// tracked must not be held under any scenario lock when called.
+//
+// Dedup: cf readAll re-delivers the entire campfire history on every poll iteration.
+// Without dedup, the same tool-usage message increments toolUsageCalls on each poll,
+// causing forge_calls to grow as N×actual (mallcoppro-5119). Each message is
+// deduplicated by msg.ID via ts.seenToolUsageMsgs before incrementing counters.
+// Messages with an empty ID (pre-timestamp campfire versions) are counted without
+// dedup to preserve backward compatibility.
+func accumulateToolUsage(msg cfMessage, tracked map[string]*trackedScenario) {
+	if msg.Payload == "" {
+		return
+	}
+	var p toolUsagePayload
+	if err := json.Unmarshal([]byte(msg.Payload), &p); err != nil {
+		return
+	}
+	if p.ForgeCalls == 0 {
+		return
+	}
+
+	// Extract finding_id from tags first (finding:<id>), then payload field.
+	findingID := p.FindingID
+	if findingID == "" {
+		for _, tag := range msg.Tags {
+			if strings.HasPrefix(tag, "finding:") && !strings.HasPrefix(tag, "finding:annotation") {
+				findingID = strings.TrimPrefix(tag, "finding:")
+				break
+			}
+		}
+	}
+	if findingID == "" {
+		return
+	}
+
+	for _, ts := range tracked {
+		ts.mu.Lock()
+		// Guard (mallcoppro-0f9 + mallcoppro-4dc): if the scenario's cf post
+		// failed, workItemID is empty and no real worker ever ran for this scenario.
+		// Attributing tool-usage to it would produce ghost forge_calls from prior
+		// bakeoff runs. With 4dc's strict matchesFindingTag (no scenarioID fallback)
+		// + timestamped run-ids, this guard is defense-in-depth.
+		// Drop the message and log it so future debugging is easy.
+		if ts.workItemID == "" {
+			slog.Debug("dropping tool-usage for unposted scenario",
+				"scenario_id", ts.scenarioID,
+				"msg_id", msg.ID,
+			)
+			ts.mu.Unlock()
+			continue
+		}
+		match := matchesFindingTag(ts, findingID)
+		if match && msg.ID != "" {
+			// Dedup: skip if we've already counted this message (mallcoppro-5119).
+			// Only dedup when msg.ID is non-empty; pre-ID messages pass through.
+			if ts.seenToolUsageMsgs == nil {
+				ts.seenToolUsageMsgs = make(map[string]bool)
+			}
+			if ts.seenToolUsageMsgs[msg.ID] {
+				ts.mu.Unlock()
+				return
+			}
+			ts.seenToolUsageMsgs[msg.ID] = true
+		}
+		if match {
+			ts.toolUsageCalls += p.ForgeCalls
+			ts.toolUsageTokensIn += p.TokensIn
+			ts.toolUsageTokensOut += p.TokensOut
+		}
+		ts.mu.Unlock()
+		if match {
+			return
+		}
+	}
+}
+
+// matchesFindingTag reports whether tagFindingID refers to ts.
+// ts.mu must be held by the caller.
+//
+// Strict exact matching only (mallcoppro-4dc). Two forms are checked:
+//
+//  1. Primary: exact match against ts.findingID (perRunFindingID or findingTrackingID
+//     format, depending on whether s.Finding.ID was set).
+//
+//  2. Alt: exact match against ts.altFindingID (findingTrackingID format, always set).
+//     Workers that use the triage→investigate escalation path embed the current
+//     run's altFindingID exactly; this is safe to match.
+//
+// The scenarioID-suffix fallback from mallcoppro-c33 is intentionally removed.
+// With timestamp-embedded run-IDs (bk-<lane>-<YYYYMMDD-HHMMSS>), stale messages
+// from a prior run carry a different timestamp in their finding tag and will NOT
+// match either ts.findingID or ts.altFindingID. Cross-run ghost attribution is
+// therefore impossible without the fallback. The 647 guard is preserved: tags
+// without a "finding:" prefix never reach this function.
+func matchesFindingTag(ts *trackedScenario, tagFindingID string) bool {
+	if ts.findingID == tagFindingID {
+		return true
+	}
+	if ts.altFindingID != "" && ts.altFindingID == tagFindingID {
+		return true
+	}
+	return false
 }
 
 // ---- JSON output helpers ------------------------------------------------------
@@ -955,9 +1294,26 @@ func writeScenarioRecord(ts *trackedScenario, runID, targetCampfire, outputDir s
 		rec.TerminalItemID = ts.terminalItemID
 	}
 
-	// Forge metering: query usage for the scenario's time window.
-	// Non-fatal: failure results in zero counts (metering miss, not a pipeline failure).
-	if len(uf) > 0 && uf[0] != nil {
+	// Forge metering: prefer campfire-sourced usage (mallcoppro-237 A2) over the
+	// HTTP billing API fetcher. The campfire path reads tool-usage messages posted
+	// by resolve-finding/escalate-to-investigator/escalate-to-stage-c, which counts
+	// forge_calls as 1 per terminal tool invocation. This avoids the 403 returned by
+	// GET /v1/usage for customer keys (GET /v1/usage requires RoleTenant auth;
+	// mallcop-sk-* keys are customer-tier and will 403 — mallcoppro-d93).
+	//
+	// Priority:
+	//   1. Campfire-accumulated data (ts.toolUsageCalls > 0): nonzero, use directly.
+	//      Short-circuits the HTTP fetcher — no RoleTenant key needed.
+	//   2. HTTP fetcher: only attempted when MALLCOP_FORGE_USAGE_HTTP_KEY is set
+	//      (the fetcher is non-nil only when that env var is present). When both
+	//      campfire data and the HTTP key are absent, forge_calls stays 0 and the
+	//      canary signals the run as suspect (mallcoppro-d93).
+	if ts.toolUsageCalls > 0 {
+		rec.ForgeCalls = ts.toolUsageCalls
+		rec.TokensIn = ts.toolUsageTokensIn
+		rec.TokensOut = ts.toolUsageTokensOut
+		// CostUSD not available from campfire path (no billing access); left zero.
+	} else if len(uf) > 0 && uf[0] != nil {
 		until := time.Now()
 		if ts.terminal {
 			until = ts.terminalAt
@@ -971,6 +1327,12 @@ func writeScenarioRecord(ts *trackedScenario, runID, targetCampfire, outputDir s
 			rec.TokensOut = usage.TokensOut
 			rec.CostUSD = usage.CostUSD
 		}
+	} else {
+		// No campfire tool-usage and no tenant key — forge_calls stays 0.
+		// The canary (canary_check_lane in run-bakeoff.sh) will flag the run
+		// if non-HC scenarios uniformly have forge_calls=0 (mallcoppro-d93).
+		slog.Info("forge usage: no campfire tool-usage and no MALLCOP_FORGE_USAGE_HTTP_KEY; forge_calls stays 0",
+			"scenario_id", ts.scenarioID)
 	}
 
 	// F4C: attach rubric if collected.

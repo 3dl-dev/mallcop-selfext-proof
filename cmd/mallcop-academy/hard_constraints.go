@@ -3,6 +3,11 @@
 // Findings whose detector matches the always-escalate set go straight to
 // "escalated" without spawning any LLM worker. Ports the March pipeline's
 // check_hard_constraints (mallcop/src/mallcop/resolution_rules.py:48-70)
+//
+// Scenario authoring contract: scenarios whose finding.detector matches a key
+// in alwaysEscalateDetectors MUST set expected.chain_action: escalated.
+// Setting chain_action: resolved is unreachable for these detectors and will
+// deterministically fail evaluation. See docs/exams/scenario-authoring.md.
 // into the Go academy seed step so eval runs avoid spending donuts on
 // scenarios that the system would always escalate by policy anyway.
 //
@@ -82,12 +87,14 @@ func seedHardConstraintEscalate(
 ) (string, error) {
 	syntheticItemID := "hard-constraint-" + findingTrackingID(runID, s.ID)
 
+	// Use ts.findingID (already suffixed with the run ID) so the finding: tag
+	// and payload finding_id are per-run-unique — consistent with the LLM path.
 	payload := hardConstraintTerminalPayload{
 		ItemID:    syntheticItemID,
 		Action:    "escalated",
 		Skill:     "task:hard-constraint",
 		Reason:    reason,
-		FindingID: s.Finding.ID,
+		FindingID: ts.findingID,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -101,7 +108,7 @@ func seedHardConstraintEscalate(
 		"detector:" + s.Finding.Detector,
 		"scenario:" + s.ID,
 		"run:" + runID,
-		"finding:" + s.Finding.ID,
+		"finding:" + ts.findingID,
 	}
 	msgID, err := sender.send(campfireID, string(body), tags)
 	if err != nil {

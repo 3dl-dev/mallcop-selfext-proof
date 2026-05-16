@@ -338,6 +338,25 @@ func runResolveFinding(inputJSON string) error {
 		return fmt.Errorf("resolve-finding: %w", err)
 	}
 
+	// Mirror the terminal signal to the work campfire when it differs from
+	// the engagement campfire (legion v0.8.2+ sets MALLCOP_CAMPFIRE_ID to
+	// the per-item engagement campfire, while academy watches the work
+	// campfire for terminal events). When the two collapse to the same
+	// campfire (operational fallback in activate), this is a no-op via
+	// the early-return inside the helper.
+	workCampfireID := os.Getenv("MALLCOP_WORK_CAMPFIRE_ID")
+	// Emit tool-usage BEFORE the terminal work:output so that the academy watch
+	// loop accumulates forge_calls before writeScenarioRecord is triggered by the
+	// work:output close. Order matters: tool-usage must arrive first (mallcoppro-b87).
+	usageCampfire := workCampfireID
+	if usageCampfire == "" {
+		usageCampfire = campfireID
+	}
+	emitToolUsage(usageCampfire, input.FindingID, os.Getenv("MALLCOP_ITEM_ID"))
+	if workCampfireID != "" && workCampfireID != campfireID {
+		emitScenarioTerminalWorkOutput(workCampfireID, input.FindingID, input.Action, input.Reason, os.Getenv("MALLCOP_ITEM_ID"))
+	}
+
 	return emitJSON(map[string]interface{}{
 		"finding_id": input.FindingID,
 		"action":     input.Action,
@@ -422,7 +441,12 @@ type workCreatePayload struct {
 // cfWorkCreate posts a work:create message to the work campfire and returns
 // the new item ID extracted from the rd output. It creates an rd item with
 // the given skill and returns that item's ID.
-func cfWorkCreate(workCampfireID, skill, title, context string) (string, error) {
+//
+// findingID, when non-empty, is added as a "finding:<id>" tag on the work:create
+// message so that mallcop-academy can attribute downstream investigate/escalate
+// items to the originating scenario even when those items have fresh rd IDs that
+// are not yet in academy's chain map (mallcoppro-60e).
+func cfWorkCreate(workCampfireID, skill, title, context, findingID string) (string, error) {
 	// Create the rd item first to get a real item ID.
 	itemID, err := rdCreateItem(title, "task", "p1", skill, context)
 	if err != nil {
@@ -441,8 +465,107 @@ func cfWorkCreate(workCampfireID, skill, title, context string) (string, error) 
 	if marshalErr != nil {
 		return itemID, nil // item created; campfire post failure is non-fatal
 	}
-	_, _ = cfSend(workCampfireID, string(payload), []string{"work:create", "skill:" + skill})
+	tags := []string{"work:create", "skill:" + skill}
+	if findingID != "" {
+		tags = append(tags, "finding:"+findingID)
+	}
+	_, _ = cfSend(workCampfireID, string(payload), tags)
 	return itemID, nil
+}
+
+// emitScenarioTerminalWorkOutput posts a work:output to the work campfire
+// announcing the originating worker's terminal verdict on a finding. This is
+// the message mallcop-academy watches for as proof-of-resolution: the
+// work:output carries finding:<id> and action:<verb> tags so academy can
+// match it back to the scenario it spawned.
+//
+// Chain-handoff tools (escalate-to-investigator, escalate-to-stage-c,
+// escalate-to-deep) call this after cfWorkCreate so the originating
+// scenario gets a deterministic terminal even though the chain itself
+// continues downstream. Without this, the originating triage/investigate
+// worker exits with only a generic "automaton-manager: worker completed"
+// close — no scenario tag, no action tag — and the bakeoff academy never
+// observes the scenario as terminal.
+//
+// Best-effort: campfire-post failures are logged but not surfaced as
+// tool errors. The chain item has already been created; the missing
+// terminal signal is a grading-visibility issue, not a workflow blocker.
+func emitScenarioTerminalWorkOutput(workCampfireID, findingID, action, summary, parentItemID string) {
+	if workCampfireID == "" || findingID == "" || action == "" {
+		return
+	}
+	payload := map[string]interface{}{
+		"finding_id": findingID,
+		"action":     action,
+		"reason":     summary,
+		"timestamp":  nowRFC3339(),
+	}
+	if parentItemID != "" {
+		payload["item_id"] = parentItemID
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "terminal work:output marshal: %v\n", err)
+		return
+	}
+	tags := []string{
+		"work:output",
+		"gate:checked",
+		"finding:" + findingID,
+		"action:" + action,
+	}
+	if _, sendErr := cfSend(workCampfireID, string(body), tags); sendErr != nil {
+		fmt.Fprintf(os.Stderr, "terminal work:output send: %v\n", sendErr)
+	}
+}
+
+// emitToolUsage posts a tool-usage message to the work campfire with forge_calls=1
+// plus optional token counts from MALLCOP_SESSION_TOKENS_IN / MALLCOP_SESSION_TOKENS_OUT
+// env vars (A2.b forward-compat path — left as 0 when not set). Academy reads these
+// messages and accumulates them into per-scenario forge_calls/tokens_in/tokens_out
+// without needing billing API access (mallcoppro-237 A2).
+// Best-effort: errors are logged but never returned to the caller.
+func emitToolUsage(campfireID, findingID, itemID string) {
+	if campfireID == "" {
+		return
+	}
+	tokensIn, _ := parseInt64Env(os.Getenv("MALLCOP_SESSION_TOKENS_IN"))
+	tokensOut, _ := parseInt64Env(os.Getenv("MALLCOP_SESSION_TOKENS_OUT"))
+	payload := map[string]interface{}{
+		"forge_calls": 1,
+		"tokens_in":   tokensIn,
+		"tokens_out":  tokensOut,
+		"timestamp":   nowRFC3339(),
+	}
+	if findingID != "" {
+		payload["finding_id"] = findingID
+	}
+	if itemID != "" {
+		payload["item_id"] = itemID
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "tool-usage: marshal: %v\n", err)
+		return
+	}
+	tags := []string{"tool-usage"}
+	if findingID != "" {
+		tags = append(tags, "finding:"+findingID)
+	}
+	if _, sendErr := cfSend(campfireID, string(body), tags); sendErr != nil {
+		fmt.Fprintf(os.Stderr, "tool-usage: campfire send: %v\n", sendErr)
+	}
+}
+
+// parseInt64Env parses an integer from an env var string.
+// Returns 0 and an error when s is empty or not an integer.
+func parseInt64Env(s string) (int64, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty")
+	}
+	var n int64
+	_, err := fmt.Sscanf(s, "%d", &n)
+	return n, err
 }
 
 // escalateToInvestigatorInput is the input_schema for escalate-to-investigator.
@@ -476,10 +599,21 @@ func runEscalateToInvestigator(inputJSON string) error {
 	title := fmt.Sprintf("investigate: %s", input.FindingID)
 	ctx := fmt.Sprintf("skill=task:investigate finding_id=%s reason=%s parent_item_id=%s",
 		input.FindingID, input.Reason, parentItemID)
-	itemID, err := cfWorkCreate(workCampfireID, "task:investigate", title, ctx)
+	itemID, err := cfWorkCreate(workCampfireID, "task:investigate", title, ctx, input.FindingID)
 	if err != nil {
 		return fmt.Errorf("escalate-to-investigator: %w", err)
 	}
+
+	// Emit tool-usage BEFORE the terminal work:output so that the academy watch
+	// loop accumulates forge_calls before writeScenarioRecord is triggered by the
+	// work:output close. Order matters: tool-usage must arrive first (mallcoppro-b87).
+	emitToolUsage(workCampfireID, input.FindingID, parentItemID)
+	// Terminal signal for the originating worker — academy needs this to
+	// observe the scenario as resolved-by-escalation. Without it the only
+	// close on the wire is automaton-manager's generic "worker completed"
+	// which carries no finding/scenario tag, and the bakeoff never grades
+	// non-hard-constraint scenarios as terminal.
+	emitScenarioTerminalWorkOutput(workCampfireID, input.FindingID, "escalated", input.Reason, parentItemID)
 
 	return emitJSON(map[string]interface{}{
 		"item_id":    itemID,
@@ -529,10 +663,17 @@ func runEscalateToStageC(inputJSON string) error {
 	title := fmt.Sprintf("escalate: %s [%s]", input.FindingID, input.ActionClass)
 	ctx := fmt.Sprintf("skill=task:escalate finding_id=%s action_class=%s reason=%s flags=%s parent_item_id=%s",
 		input.FindingID, input.ActionClass, input.Reason, flagsStr, parentItemID)
-	itemID, err := cfWorkCreate(workCampfireID, "task:escalate", title, ctx)
+	itemID, err := cfWorkCreate(workCampfireID, "task:escalate", title, ctx, input.FindingID)
 	if err != nil {
 		return fmt.Errorf("escalate-to-stage-c: %w", err)
 	}
+
+	// Emit tool-usage BEFORE the terminal work:output so that the academy watch
+	// loop accumulates forge_calls before writeScenarioRecord is triggered by the
+	// work:output close. Order matters: tool-usage must arrive first (mallcoppro-b87).
+	emitToolUsage(workCampfireID, input.FindingID, parentItemID)
+	// Terminal signal for academy — see emitScenarioTerminalWorkOutput.
+	emitScenarioTerminalWorkOutput(workCampfireID, input.FindingID, "escalated", input.Reason, parentItemID)
 
 	return emitJSON(map[string]interface{}{
 		"item_id":      itemID,
@@ -578,10 +719,17 @@ func runEscalateToDeep(inputJSON string) error {
 	title := fmt.Sprintf("deep-investigate: %s [%s]", input.FindingID, input.Hypothesis)
 	ctx := fmt.Sprintf("skill=task:deep-investigate finding_id=%s hypothesis=%s partial_transcript_path=%s parent_item_id=%s",
 		input.FindingID, input.Hypothesis, input.PartialTranscriptPath, parentItemID)
-	itemID, err := cfWorkCreate(workCampfireID, "task:deep-investigate", title, ctx)
+	itemID, err := cfWorkCreate(workCampfireID, "task:deep-investigate", title, ctx, input.FindingID)
 	if err != nil {
 		return fmt.Errorf("escalate-to-deep: %w", err)
 	}
+
+	// Emit tool-usage BEFORE the terminal work:output so that the academy watch
+	// loop accumulates forge_calls before writeScenarioRecord is triggered by the
+	// work:output close. Order matters: tool-usage must arrive first (mallcoppro-b87).
+	emitToolUsage(workCampfireID, input.FindingID, parentItemID)
+	// Terminal signal for academy — see emitScenarioTerminalWorkOutput.
+	emitScenarioTerminalWorkOutput(workCampfireID, input.FindingID, "escalated", input.Hypothesis, parentItemID)
 
 	return emitJSON(map[string]interface{}{
 		"item_id":                itemID,
@@ -632,7 +780,7 @@ func runCreateInvestigateMerge(inputJSON string) error {
 	title := fmt.Sprintf("investigate-merge: %s", input.FindingID)
 	ctx := fmt.Sprintf("skill=task:investigate-merge finding_id=%s deep_item_ids=%s parent_item_id=%s",
 		input.FindingID, strings.Join(input.DeepItemIDs, ","), parentItemID)
-	mergeItemID, err := cfWorkCreate(workCampfireID, "task:investigate-merge", title, ctx)
+	mergeItemID, err := cfWorkCreate(workCampfireID, "task:investigate-merge", title, ctx, input.FindingID)
 	if err != nil {
 		return fmt.Errorf("create-investigate-merge: %w", err)
 	}
