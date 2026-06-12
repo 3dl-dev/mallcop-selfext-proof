@@ -29,6 +29,16 @@ Answer these questions using the data from steps 1-2:
 
 ### Step 4: Decide
 
+**PATTERN-MATCH ESCALATION (overrides confidence):**
+If the finding matches any of these patterns, ESCALATE regardless of confidence:
+- (a) authentication failure bursts (5+ failures within 60s same actor)
+- (b) actions occurring during declared maintenance windows or change-control freezes
+- (c) volume anomalies during batch-processing windows (month-end, quarter-end, scheduled syncs)
+
+These patterns require investigate-level validation because triage cannot distinguish
+stolen-credential exfiltration that mimics the pattern from the legitimate operation.
+
+**Otherwise:**
 - If A=routine AND B=trigger AND C=distinguishable AND D=no → RESOLVE
 - Privilege changes → always ESCALATE (non-negotiable)
 - Log format drift → always ESCALATE
