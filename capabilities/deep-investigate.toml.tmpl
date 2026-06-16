@@ -7,6 +7,9 @@ tools = [
   "read-config",
   "annotate-finding", "resolve-finding",
   "load-skill",
+  # mallcoppro-db3 Fix 3: lookup pre-seeded operator-decision rules; citing a
+  # returned rule_id in resolve-finding satisfies the F2A citation requirement.
+  "lookup-rules",
 ]
 model = "{{MODEL}}"
 # NOTE: NO escalate tools — deep workers emit verdicts only; they never hand off
@@ -15,8 +18,8 @@ model = "{{MODEL}}"
 
 [[tool_defs]]
 name = "check-baseline"
-description = "Check baseline frequency and history for an actor/entity. Returns JSON with known_user, action_count, last_seen, and baseline stats."
-input_schema = '{"type":"object","properties":{"entity":{"type":"string","description":"actor email or username"},"source":{"type":"string","description":"connector source (e.g. github)"}},"required":["entity"]}'
+description = "Check baseline frequency and history for an actor/entity, broken down by event_type. Returns frequency_by_type so you can compare the current event-type against its baseline. Pass event_type (the finding's event_type) to populate frequency_for_type with the matching count; otherwise consult frequency_by_type directly. The aggregate frequency field is preserved for back-compat but conflates all event types — prefer frequency_for_type or frequency_by_type when answering 'is this action type routine?'."
+input_schema = '{"type":"object","properties":{"entity":{"type":"string","description":"actor email or username"},"source":{"type":"string","description":"connector source (e.g. github)"},"event_type":{"type":"string","description":"finding event_type to compare against the baseline (optional; populates frequency_for_type)"}},"required":["entity"]}'
 binary = "{{TOOL_BIN_DIR}}/mallcop-investigate-tools"
 binary_args = ["--tool", "check-baseline", "--mode", "exam", "--fixture-dir", "exams/fixtures/{{RUN_ID}}"]
 
@@ -29,8 +32,8 @@ binary_args = ["--tool", "baseline-stats", "--mode", "exam", "--fixture-dir", "e
 
 [[tool_defs]]
 name = "search-events"
-description = "Search recent events by actor, type, or time range. Returns JSON array of matching events."
-input_schema = '{"type":"object","properties":{"actor":{"type":"string","description":"actor filter"},"source":{"type":"string","description":"connector source"},"type":{"type":"string","description":"event_type filter"},"since":{"type":"string","description":"RFC3339 start time"},"until":{"type":"string","description":"RFC3339 end time"}}}'
+description = "Search recent events by actor, type, or time range. Returns events AND any matched operator-decision rules; cite a matched rule_id in resolve-finding to satisfy F2A citation. When finding_family is provided, the response is a single JSON object {events, matched_rules}; without finding_family, returns a JSON array of matching events. Pass finding_family (the detector family) on every search to maximize rule citation."
+input_schema = '{"type":"object","properties":{"actor":{"type":"string","description":"actor filter"},"source":{"type":"string","description":"connector source"},"type":{"type":"string","description":"event_type filter"},"since":{"type":"string","description":"RFC3339 start time"},"until":{"type":"string","description":"RFC3339 end time"},"finding_family":{"type":"string","description":"detector family for the current finding (e.g. unusual-timing, auth-failure-burst, new-actor, volume-anomaly); when set, response includes matched operator-decision rules"},"finding_metadata":{"type":"object","additionalProperties":{"type":"string"},"description":"optional flat-map of finding metadata to include in rule matching"}}}'
 binary = "{{TOOL_BIN_DIR}}/mallcop-investigate-tools"
 binary_args = ["--tool", "search-events", "--mode", "exam", "--fixture-dir", "exams/fixtures/{{RUN_ID}}"]
 
@@ -58,8 +61,8 @@ binary_args = ["--tool", "load-skill"]
 # F1G-a: Finding-state (output tools — deep workers close their own work item)
 [[tool_defs]]
 name = "resolve-finding"
-description = "Close a finding with a resolution action. Deep workers emit 'resolved' (benign confirmed) or 'escalated' (suspicious or uncertain). Emits work:output to engagement campfire for investigate-merge to read."
-input_schema = '{"type":"object","required":["finding_id","action","reason"],"properties":{"finding_id":{"type":"string"},"action":{"type":"string","enum":["resolved","escalated"]},"reason":{"type":"string"},"confidence":{"type":"number","minimum":0,"maximum":1}}}'
+description = "Close a finding with a resolution action. Deep workers emit 'resolved' (benign confirmed) or 'escalated' (suspicious or uncertain). Emits work:output to engagement campfire for investigate-merge to read. Optional rule_id cites a pre-seeded operator-decision rule (from lookup-rules) — a valid rule_id satisfies the F2A citation requirement without requiring a retrieved event ID in the reason field."
+input_schema = '{"type":"object","required":["finding_id","action","reason"],"properties":{"finding_id":{"type":"string"},"action":{"type":"string","enum":["resolved","escalated"]},"reason":{"type":"string"},"confidence":{"type":"number","minimum":0,"maximum":1},"rule_id":{"type":"string","description":"optional operator-decision rule_id returned by lookup-rules; when valid, satisfies the F2A citation requirement"}}}'
 binary = "{{TOOL_BIN_DIR}}/mallcop-investigate-tools"
 binary_args = ["--tool", "resolve-finding"]
 
@@ -69,5 +72,13 @@ description = "Add a structured annotation to a finding. Posts finding:annotatio
 input_schema = '{"type":"object","required":["finding_id","note"],"properties":{"finding_id":{"type":"string"},"note":{"type":"string","maxLength":4096},"tags":{"type":"array","items":{"type":"string"}}}}'
 binary = "{{TOOL_BIN_DIR}}/mallcop-investigate-tools"
 binary_args = ["--tool", "annotate-finding"]
+
+# mallcoppro-db3 Fix 3: Operator-decision rule lookup
+[[tool_defs]]
+name = "lookup-rules"
+description = "Match the current finding against pre-seeded operator decisions and return matching rules. Pass the finding_id and finding_family (the detector family, e.g. \"unusual-timing\", \"new-actor\", \"volume-anomaly\") along with any observable flags (maintenance_window, scheduled, resolution_event, location_change, automation_provenance, deploy_release, sensitive_bulk_read, hr_provisioning, scenario_pattern, actor_role) — returns 0 or more matching rules with id, applies_to, and operator_directive. When a returned rule matches the situation, pass its id to resolve-finding as rule_id; this satisfies the F2A citation requirement without requiring you to embed retrieved event IDs in the reason field."
+input_schema = '{"type":"object","required":["finding_id","finding_family"],"properties":{"finding_id":{"type":"string"},"finding_family":{"type":"string","description":"detector family or finding.detector value"},"maintenance_window":{"type":"string","description":"\"true\" when the finding falls inside a declared maintenance window"},"scheduled":{"type":"string","description":"\"true\" when the activity is on a declared schedule (cron/batch)"},"resolution_event":{"type":"string","description":"name of the event_type that resolves the finding (e.g. login_success)"},"location_change":{"type":"string","description":"\"true\" when actor source location/IP changed legitimately"},"automation_provenance":{"type":"string","description":"automation source when known (e.g. terraform, github-actions)"},"deploy_release":{"type":"string","description":"\"true\" when activity is part of a deploy/release window"},"sensitive_bulk_read":{"type":"string","description":"\"true\" when the activity is a sensitive bulk read"},"hr_provisioning":{"type":"string","description":"\"true\" when the activity ties to an HR-system provisioning event"},"scenario_pattern":{"type":"string","description":"named scenario pattern (e.g. maintenance-window, scheduled-batch, fat-finger)"},"actor_role":{"type":"string","description":"actor role classifier (e.g. automation, human, ci-bot)"}}}'
+binary = "{{TOOL_BIN_DIR}}/mallcop-investigate-tools"
+binary_args = ["--tool", "lookup-rules"]
 
 # task:investigate-merge capability seed — F1E: evidence-aggregation across 3 deep workers
