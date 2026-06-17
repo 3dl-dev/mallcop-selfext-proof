@@ -359,34 +359,55 @@ func TestDateWindowAppliedWhenItMatches(t *testing.T) {
 
 // ---- §3.7 case-insensitive unmarshal: PascalCase fixture parses ------------
 
-// TestPascalCaseFixtureParses proves an event record written with PascalCase
-// keys (EventType, Timestamp, Actor, Source, ID) parses into the snake_case
-// struct tags instead of decoding to all-zero values. This is bug #5 — Go's
-// case-insensitive JSON match does NOT translate casing conventions. The fix is
-// normalizeRecordKeys at the decode boundary.
+// TestPascalCaseFixtureParses proves a fixture written in a DIFFERENT casing
+// CONVENTION than the snake_case struct tags parses through normalizeRecordKeys
+// instead of decoding to all-zero values. This is bug #5: Go's encoding/json
+// matches a key to a struct tag case-insensitively, but it does NOT translate
+// between casing conventions — it cannot strip a separator or split a camelCase
+// word. The fix is normalizeRecordKeys at the decode boundary.
+//
+// MUTATION-PROOF GATE — fixture choice is load-bearing.
+// The event.Event struct tags are single lowercase words (`id`, `source`,
+// `type`, `actor`, `timestamp`). A naïve single-word PascalCase key like "ID" /
+// "Actor" is matched by Go's case-insensitive fallback *on its own*, so it would
+// pass even with normalizeRecordKeys removed (a hollow test). To genuinely gate
+// §3.7 the fixture must use keys Go's matcher CANNOT fold to the tag — here a
+// kebab-/separator-bearing convention ("-id", "user-actor"). Go leaves the
+// separator intact and finds no matching tag, so WITHOUT normalizeRecordKeys
+// every field decodes to its zero value and the assertions below FAIL. WITH
+// normalizeRecordKeys the keys collapse to the canonical snake_case (`-id`→`id`,
+// the camelCase word boundaries fold) and the record parses. Verified by
+// mutation: replacing normalizeRecordKeys(raw) with raw in the search_events
+// decode path turns this test red (got 0 events) and restoring it turns it green.
 func TestPascalCaseFixtureParses(t *testing.T) {
 	s := newTempStore(t)
 
-	// Append a raw PascalCase event JSON directly (bypassing the typed struct so
-	// the on-disk bytes carry Pascal keys, exactly like a hand-written fixture).
-	pascal := json.RawMessage(`{"ID":"e1","Source":"azure","Type":"login","Actor":"baron","Timestamp":"2026-04-10T09:00:00Z"}`)
-	if _, err := s.Append(store.KindEvents, pascal); err != nil {
-		t.Fatalf("append pascal event: %v", err)
+	// A hand-written fixture in a convention whose keys carry separators Go's
+	// case-insensitive tag match cannot fold to the single-word struct tags.
+	// Without normalizeRecordKeys at the boundary this decodes to an all-zero
+	// event (no key matches `id`/`source`/`type`/`actor`/`timestamp`), so
+	// search-events returns ZERO events and every assertion below fails.
+	foreignConvention := json.RawMessage(`{"-id":"e1","-source":"azure","-type":"login","-actor":"baron","-timestamp":"2026-04-10T09:00:00Z"}`)
+	if _, err := s.Append(store.KindEvents, foreignConvention); err != nil {
+		t.Fatalf("append foreign-convention event: %v", err)
 	}
 
 	env, err := SearchEventsWrapped(s, SearchEventsInput{Actor: "baron"}, "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	// The decisive assertion: without key normalization the actor filter matches
+	// nothing (Actor decoded to "") and this is 0. It is 1 ONLY because
+	// normalizeRecordKeys folded the foreign keys onto the struct tags.
 	if len(env.Events) != 1 {
-		t.Fatalf("PascalCase event did not parse: got %d events (filter on actor=baron)", len(env.Events))
+		t.Fatalf("foreign-convention event did not parse: got %d events (filter actor=baron) — normalizeRecordKeys not gating decode", len(env.Events))
 	}
 	got := env.Events[0]
 	if got.ID != "e1" || got.Actor != "baron" || got.Type != "login" || got.Source != "azure" {
-		t.Errorf("PascalCase fields not mapped: %+v", got)
+		t.Errorf("foreign-convention fields not mapped (decoded to zero-values?): %+v", got)
 	}
 	if got.Timestamp != "2026-04-10T09:00:00Z" {
-		t.Errorf("PascalCase Timestamp not mapped: %q", got.Timestamp)
+		t.Errorf("foreign-convention timestamp not mapped: %q", got.Timestamp)
 	}
 }
 
