@@ -2,16 +2,22 @@
 // resolution plus the minimal anthropic.Client interface the agent loop (built
 // in a later wave) consumes.
 //
-// The single most important invariant in this package: a finding that matches a
-// hard-constraint family (secrets-exposure, priv-escalation, injection-probe,
-// boundary-violation, or a tripped volume circuit-breaker) is force-escalated by
-// checkHardConstraints BEFORE any path that could call the model. The model
-// never sees these findings. This is enforced three ways:
+// The single most important invariant in this package: a finding that matches an
+// always-escalate route in the DATA-DRIVEN floor (the `escalate_routes` corpus
+// in agents/rules/operator-decisions.yaml — seeded with priv-escalation/
+// role-grant, injection-probe, log-format-drift, secrets-exposure,
+// boundary-violation, and the volume circuit-breaker) is force-escalated by
+// checkHardConstraints BEFORE any path that could call the model. The routes are
+// DATA an operator extends without a Go change — the policy is no longer a
+// hardcoded family map (see router.go / hardconstraints.go). The model never
+// sees a routed finding. This is enforced three ways:
 //
 //  1. ResolveFinding calls checkHardConstraints first and returns immediately on
-//     a hard constraint — the Client is never touched.
+//     a routed finding — the Client is never touched.
 //  2. agent_test.go drives a spy Client whose Messages() calls t.Fatal; the
-//     REJECT/BYPASS/SANITIZE tests prove the spy's call-count stays 0.
+//     REJECT/BYPASS/EMERGENCE/SANITIZE tests prove the spy's call-count stays 0
+//     for routed findings (and that a freshly-appended route force-escalates
+//     with no code change).
 //  3. imports_test.go forbids any non-test source in this package from importing
 //     a network/inference family, so the gate path cannot reach inference at all
 //     except through the Client interface threaded in by the caller.

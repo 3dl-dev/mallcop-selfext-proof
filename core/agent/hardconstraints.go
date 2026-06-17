@@ -1,14 +1,24 @@
-// hardconstraints.go — the ONLY gate before any model call.
+// hardconstraints.go — the ONLY gate before any model call, now DATA-DRIVEN.
 //
-// Ported from the Python per-finding hard-constraint gate
+// History: this gate began as a hardcoded Go map of dangerous families. The
+// operator rejected a static auto-escalate map. The floor that ships reads its
+// always-escalate routes from a MUTABLE corpus (agents/rules/operator-
+// decisions.yaml, `escalate_routes`) — see router.go. The Go code here is the
+// routing MECHANISM (normalize → match → escalate) and the volume
+// circuit-breaker; the POLICY (which families always escalate) is data an
+// operator extends without a code change.
+//
+// Ported originally from the Python per-finding hard-constraint gate
 // (src/mallcop/resolution_rules.py: check_hard_constraints + ALWAYS_ESCALATE_
 // DETECTORS) and the boundary-violation volume circuit-breaker
-// (src/mallcop/budget.py: check_circuit_breaker, surfaced via escalate.py).
+// (src/mallcop/budget.py: check_circuit_breaker). The dangerous-family policy
+// now lives in the YAML seed instead of Go constants.
 //
 // These are hard security constraints that models fail to enforce reliably.
-// Moving them to deterministic code guarantees 100% compliance: a finding in a
-// dangerous family is escalated to a human in code, with no model in the loop
-// and no donuts spent. The model literally never sees it.
+// Moving the routing to deterministic code (and the policy to versioned data)
+// guarantees 100% compliance: a finding matching an always-escalate route is
+// escalated to a human in code, with no model in the loop and no donuts spent.
+// The model literally never sees it.
 package agent
 
 import (
@@ -33,57 +43,39 @@ const (
 // It is the only thing the floor returns; the model is never consulted to build
 // it.
 type Resolution struct {
-	// ForceEscalated is true when a hard constraint fired. When true, Action is
-	// always ActionEscalated and Reason explains which family tripped.
+	// ForceEscalated is true when an always-escalate route fired. When true,
+	// Action is always ActionEscalated and Reason explains which route tripped.
 	ForceEscalated bool
 	Action         Action
 	Reason         string
 	// Family is the normalized, canonical finding family that matched (or the
 	// normalized input family when nothing matched).
 	Family string
-}
-
-// hardConstraintFamilies is the canonical set of finding families that ALWAYS
-// escalate deterministically — no LLM involved. This is the union of the
-// Python ALWAYS_ESCALATE_DETECTORS / _NEVER_AUTO_RESOLVE security families that
-// apply per-finding, plus secrets-exposure: a leaked secret must never be
-// auto-resolved by a model.
-//
-//   - secrets-exposure  — credential/secret leakage; auditing a leak to a model
-//     would itself risk re-exposing it.
-//   - priv-escalation   — privilege changes always need human audit.
-//   - injection-probe   — prompt-injection attempts; the one thing a model is
-//     least able to adjudicate about itself.
-//   - boundary-violation — access-boundary breaches; exempt from squelch/budget
-//     in Python, always escalated.
-//
-// log-format-drift from the Python set is intentionally omitted: there is no
-// such detector in this Go codebase (the detector registry has no
-// log-format-drift), so listing it would be dead config. If that detector lands
-// later, add its canonical name here and the floor covers it automatically.
-var hardConstraintFamilies = map[string]struct{}{
-	"secrets-exposure":   {},
-	"priv-escalation":    {},
-	"injection-probe":    {},
-	"boundary-violation": {},
+	// RouteID is the id of the escalate_routes corpus rule that fired (empty when
+	// nothing matched). It makes the data-driven decision auditable: an operator
+	// can trace an escalation back to the exact corpus route.
+	RouteID string
 }
 
 // circuitBreakerFamily marks the synthetic meta-finding emitted by
-// CheckCircuitBreaker. It is itself a hard constraint so a tripped breaker is
-// surfaced to a human and never routed to the model.
+// CheckCircuitBreaker. It is itself a seeded always-escalate route (E-006) so a
+// tripped breaker is surfaced to a human and never routed to the model.
 const circuitBreakerFamily = "mallcop-budget"
 
 // familyAliases maps known evasions / aliases of a dangerous signature onto its
-// canonical family. This is the BYPASS defense: an attacker (or a sloppy
-// detector) that emits "privilege-escalation", "prompt-injection", or
-// "secret_exposure" instead of the canonical name still trips the floor. The
-// keys are already case-folded and separator-normalized (see normalizeFamily),
-// so only the alphanumeric spelling needs listing.
+// canonical family — a normalization aid retained from the original floor so a
+// finding family is canonicalized consistently on the proceed (benign) path
+// too. The authoritative alias→route mapping for the FLOOR lives in the corpus
+// (`escalate_routes[].aliases`); this map only normalizes the canonical family
+// name reported back to the caller. Keys are already case-folded and
+// separator-normalized (see normalizeFamily).
 var familyAliases = map[string]string{
 	// priv-escalation aliases
-	"privilegeescalation": "priv-escalation",
-	"privesc":             "priv-escalation",
-	"privilegeesc":        "priv-escalation",
+	"privilegeescalation":      "priv-escalation",
+	"privesc":                  "priv-escalation",
+	"privilegeesc":             "priv-escalation",
+	"rolegrant":                "priv-escalation",
+	"permissionboundarychange": "priv-escalation",
 	// injection-probe aliases
 	"promptinjection":  "injection-probe",
 	"injectionattempt": "injection-probe",
@@ -93,35 +85,27 @@ var familyAliases = map[string]string{
 	"secretsexposure": "secrets-exposure",
 	"secretleak":      "secrets-exposure",
 	"secretsleak":     "secrets-exposure",
+	"credentialleak":  "secrets-exposure",
 	// boundary-violation aliases
-	"boundarybreach": "boundary-violation",
+	"boundarybreach":       "boundary-violation",
+	"accessboundarybreach": "boundary-violation",
+	// log-format-drift aliases
+	"parsermismatch":           "log-format-drift",
+	"logdrift":                 "log-format-drift",
+	"unmatchedeventratiospike": "log-format-drift",
+	"logtampering":             "log-format-drift",
 }
 
-// canonicalFamilies maps the case-folded, separator-stripped spelling of each
-// canonical family back to the canonical hyphenated form. Built once from
-// hardConstraintFamilies so "INJECTION-PROBE", "injection_probe", and
-// "injectionprobe" all resolve to "injection-probe".
-var canonicalFamilies = func() map[string]string {
-	m := make(map[string]string, len(hardConstraintFamilies))
-	for fam := range hardConstraintFamilies {
-		m[stripSeparators(fam)] = fam
-	}
-	return m
-}()
-
-// normalizeFamily reduces a raw finding family to its canonical hard-constraint
-// name when it matches one (directly, by alias, or by separator/case evasion),
-// or returns the trimmed lower-cased input otherwise.
-//
-// This is the BYPASS hardening: case folding, whitespace trimming, and
-// separator stripping collapse "  Injection-Probe ", "PRIV-ESCALATION", and
-// "secrets_exposure" onto their canonical forms before the membership test.
+// normalizeFamily reduces a raw finding family to a canonical name when it
+// matches a known dangerous signature (directly or by alias), or returns the
+// trimmed lower-cased input otherwise. This is the BYPASS hardening on the
+// REPORTED family: case folding, whitespace trimming, and separator stripping
+// collapse "  Injection-Probe ", "PRIV-ESCALATION", and "secrets_exposure" onto
+// their canonical forms. The actual escalate DECISION is made by the router's
+// trigger-set match (router.go), which folds the corpus aliases the same way.
 func normalizeFamily(raw string) string {
 	trimmed := strings.ToLower(strings.TrimSpace(raw))
 	stripped := stripSeparators(trimmed)
-	if canon, ok := canonicalFamilies[stripped]; ok {
-		return canon
-	}
 	if canon, ok := familyAliases[stripped]; ok {
 		return canon
 	}
@@ -144,46 +128,69 @@ func stripSeparators(s string) string {
 	return b.String()
 }
 
-// checkHardConstraints is the ONLY gate before any model call. It is the direct
-// port of resolution_rules.check_hard_constraints, hardened against family-match
-// evasion.
+// checkHardConstraints is the ONLY gate before any model call. It is now
+// data-driven: it loads the always-escalate routes from the operator-decisions
+// corpus and force-escalates any finding that matches one — no model, no I/O
+// beyond the one corpus read, no network.
 //
 // It returns (forceEscalate, resolution):
-//   - forceEscalate=true with an escalated Resolution when the finding's family
-//     is a hard constraint (or a tripped circuit-breaker meta-finding). The
-//     caller MUST NOT call the model in this case.
+//   - forceEscalate=true with an escalated Resolution when the finding matches a
+//     corpus escalate_route. The caller MUST NOT call the model in this case.
 //   - forceEscalate=false with a proceed Resolution otherwise; the caller may
 //     route the finding to the model.
 //
-// No model involvement, no I/O, no network — pure code enforcement.
+// Fail-safe on corpus load error: if the corpus is present but unparseable, the
+// floor cannot trust its policy, so it force-escalates rather than waving the
+// finding through to the model (never fail open). A MISSING corpus is treated as
+// an empty floor (no routes) — the resolve-gate fail-safe downstream still
+// covers unparseable/ambiguous findings.
 func checkHardConstraints(f finding.Finding) (bool, Resolution) {
-	fam := normalizeFamily(f.Type)
-
-	if fam == circuitBreakerFamily {
+	repoRoot, rootErr := resolveRepoRoot()
+	if rootErr != nil {
+		// Cannot even locate the corpus — fail safe: escalate, do not guess.
 		return true, Resolution{
 			ForceEscalated: true,
 			Action:         ActionEscalated,
-			Family:         fam,
-			Reason: "Hard constraint: volume circuit-breaker tripped — too many findings " +
-				"for safe autonomous handling; human review required (deterministic, no LLM)",
+			Family:         normalizeFamily(f.Type),
+			Reason: fmt.Sprintf(
+				"Hard constraint (fail-safe): cannot locate escalate-route corpus (%v); "+
+					"escalating for human review rather than routing to the model", rootErr),
 		}
 	}
 
-	if _, ok := hardConstraintFamilies[fam]; ok {
+	routes, err := loadEscalateRoutes(repoRoot)
+	if err != nil {
+		// Corpus present but broken — fail safe: escalate, do not route to model.
 		return true, Resolution{
 			ForceEscalated: true,
 			Action:         ActionEscalated,
-			Family:         fam,
+			Family:         normalizeFamily(f.Type),
 			Reason: fmt.Sprintf(
-				"Hard constraint: %s findings always require human review "+
-					"(deterministic escalation, no LLM involved)", fam),
+				"Hard constraint (fail-safe): escalate-route corpus unparseable (%v); "+
+					"escalating for human review rather than routing to the model", err),
+		}
+	}
+
+	if route, ok := matchEscalateRoute(routes, f); ok {
+		reason := strings.TrimSpace(route.Reason)
+		if reason == "" {
+			reason = fmt.Sprintf(
+				"Hard constraint: route %s (%s) always requires human review "+
+					"(deterministic escalation, no LLM involved)", route.ID, route.Family)
+		}
+		return true, Resolution{
+			ForceEscalated: true,
+			Action:         ActionEscalated,
+			Family:         normalizeFamily(f.Type),
+			RouteID:        route.ID,
+			Reason:         reason,
 		}
 	}
 
 	return false, Resolution{
 		ForceEscalated: false,
 		Action:         ActionProceed,
-		Family:         fam,
+		Family:         normalizeFamily(f.Type),
 	}
 }
 
@@ -200,9 +207,10 @@ type BudgetConfig struct {
 //
 // When the number of findings exceeds MaxFindingsForActors, it returns a
 // synthetic CRITICAL meta-finding (family "mallcop-budget") describing the trip.
-// That meta-finding is itself a hard constraint (see checkHardConstraints), so a
-// tripped breaker is surfaced to a human and never routed to the model. When the
-// count is at or under the threshold it returns nil — no breaker.
+// That meta-finding matches the seeded E-006 escalate_route (see
+// checkHardConstraints), so a tripped breaker is surfaced to a human and never
+// routed to the model. When the count is at or under the threshold it returns
+// nil — no breaker.
 //
 // The breaker is a volume defense: a flood of findings (e.g. an attacker
 // generating noise to drown a real boundary violation) must not be quietly
@@ -231,15 +239,4 @@ func CheckCircuitBreaker(findings []finding.Finding, cfg BudgetConfig) *finding.
 			"Volume circuit breaker triggered: %d findings exceed threshold %d (severity breakdown: %s)",
 			len(findings), cfg.MaxFindingsForActors, strings.Join(parts, " ")),
 	}
-}
-
-// hardConstraintFamiliesForTest exposes the canonical hard-constraint families
-// to the package test (RESOLUTION-RULES positive case) without exporting the
-// internal map.
-func hardConstraintFamiliesForTest() []string {
-	out := make([]string, 0, len(hardConstraintFamilies))
-	for fam := range hardConstraintFamilies {
-		out = append(out, fam)
-	}
-	return out
 }

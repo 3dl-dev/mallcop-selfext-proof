@@ -12,7 +12,7 @@
 //
 //   - Sanitize(s)            — neutralize one untrusted string and box it.
 //   - WrapUntrusted(label,d) — neutralize + box untrusted data under a named
-//                              label, for embedding a titled block in a prompt.
+//     label, for embedding a titled block in a prompt.
 //
 // Both build on the package-internal SanitizeField (the single source of truth
 // for control-char stripping, marker-breakout defense, and length capping).
