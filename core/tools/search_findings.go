@@ -50,7 +50,9 @@ func SearchFindings(s *store.Store, in SearchFindingsInput) ([]finding.Finding, 
 	out := make([]finding.Finding, 0, len(raws))
 	for i, raw := range raws {
 		var f finding.Finding
-		if err := json.Unmarshal(raw, &f); err != nil {
+		// §3.7: normalize key casing at the boundary so PascalCase / camelCase /
+		// kebab-case fixtures parse into the snake_case struct tags.
+		if err := json.Unmarshal(normalizeRecordKeys(raw), &f); err != nil {
 			return nil, fmt.Errorf("search-findings: decode finding %d: %w", i, err)
 		}
 		if in.Actor != "" && !strings.EqualFold(f.Actor, in.Actor) {
