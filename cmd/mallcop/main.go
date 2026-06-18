@@ -59,10 +59,16 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `mallcop — security scan CLI
 
 Commands:
-  scan    Run a one-shot security scan cycle
-    --chart    Path to the legion chart TOML (default: charts/vertical-slice.toml)
-    --timeout  Max time to wait for scan completion (default: 10m)
-    --json     Output results as JSON
+  scan    Run a one-shot agentic security scan (connect -> detect -> cascade -> store)
+    --events    Events JSONL source (file path, or "-" for stdin; default: "-")
+    --store     Path to the git-repo store for findings/resolutions (required)
+    --baseline  Optional path to a baseline JSON file
+    --base-url  Inference endpoint base URL (overrides $MALLCOP_INFERENCE_URL)
+    --workers   Bounded resolve-pool size (0 = pipeline default)
+    --json      Output the summary as JSON
+                Inference auth: $MALLCOP_INFERENCE_URL + $MALLCOP_API_KEY
+                (BYOK: vendor URL+key; Forge: forge URL + mallcop-sk-* key).
+                With no URL, every finding force-escalates (fail-safe).
 
   detect  Run offline detection over events JSONL on stdin (no inference key)
     --baseline  Optional path to a baseline JSON file

@@ -1,21 +1,37 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
+	"github.com/mallcop-app/mallcop/core/agent"
+	"github.com/mallcop-app/mallcop/core/connect"
+	"github.com/mallcop-app/mallcop/core/inference"
+	"github.com/mallcop-app/mallcop/core/pipeline"
+	"github.com/mallcop-app/mallcop/core/store"
+	"github.com/mallcop-app/mallcop/pkg/baseline"
 	"github.com/mallcop-app/mallcop/pkg/finding"
 	"github.com/mallcop-app/mallcop/pkg/resolution"
 )
 
 const (
-	defaultChart   = "charts/vertical-slice.toml"
-	defaultTimeout = 10 * time.Minute
+	defaultChart = "charts/vertical-slice.toml"
+
+	// envInferenceURL / envInferenceKey are the {BaseURL, Key} pivot: point the URL
+	// at the vendor for BYOK or at Forge for the metered managed path; the key is
+	// the vendor key (BYOK) or a mallcop-sk-* tenant key (Forge). Empty URL means
+	// "no inference client" — the scan still runs and force-escalates everything
+	// (the cascade's documented nil-client fail-safe), it just resolves nothing.
+	envInferenceURL = "MALLCOP_INFERENCE_URL"
+	envInferenceKey = "MALLCOP_API_KEY"
+	// envInferenceModel optionally overrides the model id sent on the wire.
+	envInferenceModel = "MALLCOP_MODEL"
 )
 
 // ScanSummary holds the results of a completed scan cycle.
@@ -26,44 +42,149 @@ type ScanSummary struct {
 	Resolved         int `json:"resolved"`
 }
 
-// scanOutput collects structured Findings and Resolutions parsed from the
-// agentic scan pipeline output (JSONL). Each line may be a Finding or a
-// Resolution. Retained because the JSONL/output-dir parsing helpers below are
-// exercised by tests and will be reused when the in-process scan pipeline is
-// wired (pending core/pipeline).
+// scanOutput collects structured Findings and Resolutions parsed from a JSONL
+// stream. Each line may be a Finding or a Resolution. The live scan path is now
+// the in-process pipeline (runScan → core/pipeline), which writes findings +
+// resolutions straight to the git store; these JSONL/output-dir parsing helpers
+// remain as utilities for reading a store-written stream back (and are covered by
+// main_test.go).
 type scanOutput struct {
 	findings    []finding.Finding
 	resolutions []resolution.Resolution
 }
 
-// errScanPipelineNotWired is returned by runScan while the agentic scan path is
-// stubbed. The previous implementation exec'd the external legion binary
-// (`we start --chart … --exit-on-idle`); that coupling has been removed. The
-// in-process scan pipeline is a later item (pending core/pipeline).
-var errScanPipelineNotWired = fmt.Errorf(
-	"in-process scan pipeline not yet wired (pending core/pipeline); " +
-		"the legion-backed agentic scan path has been removed")
-
+// runScan implements `mallcop scan`: the full in-process agentic scan pipeline,
+// connect → detect → cascade → store, assembled from the core packages.
+//
+// It reads events from the --events source (a file path, or "-"/stdin), runs the
+// deterministic detector floor, resolves EACH finding through the tiered
+// triage→investigate→escalate cascade against the inference endpoint named by
+// MALLCOP_INFERENCE_URL (+ MALLCOP_API_KEY — the BYOK ⇄ Forge pivot), and durably
+// appends the findings + resolutions to the git store at --store. It prints a
+// summary and returns the findings sentinel (exit 1) when any finding was flagged.
+//
+// Exit codes (mapped in main.go):
+//
+//	0  No findings
+//	1  Findings present (errFindings sentinel)
+//	2  Scan failure (any other error)
 func runScan(args []string) error {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
-	chartPath := fs.String("chart", defaultChart, "Path to the scan chart TOML")
-	_ = fs.String("timeout", "10m", "Max wait time for scan completion (reserved for the in-process pipeline)")
-	_ = fs.Bool("json", false, "Output results as JSON (reserved for the in-process pipeline)")
+	eventsPath := fs.String("events", "-", `Events JSONL source (file path, or "-" for stdin)`)
+	storePath := fs.String("store", "", "Path to the git-repo store for findings/resolutions (created if missing)")
+	baselinePath := fs.String("baseline", "", "Optional path to a baseline JSON file")
+	baseURL := fs.String("base-url", "", "Inference endpoint base URL (overrides $"+envInferenceURL+")")
+	workers := fs.Int("workers", 0, "Bounded resolve-pool size (0 = pipeline default)")
+	asJSON := fs.Bool("json", false, "Output the summary as JSON")
+	// --chart is retained for backward-compatible invocation but is no longer
+	// required or consulted by the in-process pipeline.
+	_ = fs.String("chart", "", "(deprecated; ignored by the in-process pipeline)")
+	_ = fs.String("timeout", "10m", "(deprecated; the pipeline runs to completion)")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	// Validate the chart path exists so the command fails fast and clearly,
-	// matching the deterministic-path UX, rather than only at pipeline wiring.
-	if _, err := os.Stat(*chartPath); err != nil {
-		return fmt.Errorf("scan chart %s: %w", *chartPath, err)
+	if *storePath == "" {
+		return fmt.Errorf("scan: --store is required (the git-repo path where findings/resolutions are written)")
 	}
 
-	// The agentic scan path is intentionally a no-op until the in-process
-	// pipeline lands. Deterministic detection remains available via the
-	// standalone detector-* binaries. Return a clear, actionable error.
-	return errScanPipelineNotWired
+	// (1) Resolve the inference client: the {BaseURL, Key} pivot. The flag wins;
+	// otherwise the env var. An empty URL yields a nil client — the scan still
+	// runs and force-escalates everything (cascade fail-safe), never resolving.
+	url := *baseURL
+	if url == "" {
+		url = os.Getenv(envInferenceURL)
+	}
+	var client agent.Client
+	if url != "" {
+		model := os.Getenv(envInferenceModel)
+		if model == "" {
+			model = "mallcop-default"
+		}
+		client = &inference.DirectClient{
+			BaseURL: url,
+			Key:     os.Getenv(envInferenceKey),
+			Model:   model,
+		}
+	}
+
+	// (2) Open (initializing if necessary) the git store.
+	st, err := openOrInitStore(*storePath)
+	if err != nil {
+		return err
+	}
+
+	// (3) Load the optional baseline.
+	var bl *baseline.Baseline
+	if *baselinePath != "" {
+		bl, err = baseline.Load(*baselinePath)
+		if err != nil {
+			return fmt.Errorf("scan: load baseline %s: %w", *baselinePath, err)
+		}
+	}
+
+	// (4) Run the pipeline.
+	ctx := context.Background()
+	sum, err := pipeline.Run(ctx, pipeline.Config{
+		Connector: connect.FromPath(*eventsPath),
+		Client:    client,
+		Store:     st,
+		Baseline:  bl,
+		Workers:   *workers,
+	})
+	if err != nil {
+		return fmt.Errorf("scan: %w", err)
+	}
+
+	out := ScanSummary{
+		EventsScanned:    sum.EventsScanned,
+		FindingsDetected: sum.FindingsDetected,
+		Escalated:        sum.Escalated,
+		Resolved:         sum.Resolved,
+	}
+	if *asJSON {
+		if err := printJSON(out); err != nil {
+			return fmt.Errorf("scan: encode summary: %w", err)
+		}
+	} else {
+		printSummary(out)
+	}
+
+	// Exit 1 when anything was flagged; the sentinel is mapped to exit 1 in main.
+	if sum.FindingsDetected > 0 {
+		return errFindings
+	}
+	return nil
+}
+
+// openOrInitStore opens the git-backed store at path, running `git init` (and a
+// minimal author config + an empty initial commit) first if path is not yet a
+// git work tree. The store itself does NOT create repos (that is the CLI's job);
+// this is where the CLI owns that lifecycle.
+func openOrInitStore(path string) (*store.Store, error) {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return nil, fmt.Errorf("scan: create store dir %q: %w", path, err)
+	}
+	if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
+		for _, args := range [][]string{
+			{"init", "-q"},
+			{"config", "user.email", "store@mallcop.app"},
+			{"config", "user.name", "mallcop-store"},
+			{"commit", "--allow-empty", "-q", "-m", "mallcop scan: init store"},
+		} {
+			cmd := exec.Command("git", args...)
+			cmd.Dir = path
+			if outBytes, err := cmd.CombinedOutput(); err != nil {
+				return nil, fmt.Errorf("scan: git %v in %q: %w\n%s", args, path, err, outBytes)
+			}
+		}
+	}
+	st, err := store.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("scan: open store %q: %w", path, err)
+	}
+	return st, nil
 }
 
 // errFindings is returned by runScan when findings are present (exit code 1).
