@@ -1,0 +1,385 @@
+// tier.go — one tier of the cascade: build the (untrusted-data-safe) prompt,
+// run the model, gather tool evidence, parse the model's verdict, and assemble
+// the structural signals the gate scores.
+//
+// A "tier" is triage or investigate. Both follow the same shape:
+//
+//  1. Gather tool evidence (via the injected ToolRunner seam — never core/tools
+//     directly). The evidence Text is UNTRUSTED.
+//  2. Build the user message: the finding fields AND the tool transcript are
+//     each WrapUntrusted + sanitized (§2.7 ## Security + §3 untrusted data) before
+//     they enter model context. The system prompt is the ported POST.md, which
+//     carries the ## Security block.
+//  3. Call the model once (this wave: the canned/real backend returns a verdict
+//     as text; a later wave adds the multi-turn tool-use loop). Parse the reply
+//     into a verdict + self-confidence + reason.
+//  4. Assemble tierResult: the parsed verdict + the OBSERVABLE structural signals
+//     (tool calls, distinct tools, iterations, reason text) the confidence gate
+//     scores. None of the structural signals is self-reported by the model.
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/mallcop-app/mallcop/pkg/finding"
+)
+
+// tierResult is the outcome of running one cascade tier. It separates the model's
+// PROPOSAL (verdict, selfConfidence, reason) from the OBSERVABLE signals
+// (toolCalls, distinctTools, toolEmpty) the runtime measured — the gates judge
+// the proposal using the observable signals, never the model's self-assessment.
+type tierResult struct {
+	tier       string
+	verdict    Verdict
+	reason     string // model's reason text (already sanitized of control chars by parse)
+	selfConf   int    // model's self-reported 1-5 confidence; 0 when none supplied
+	hasPosEvid bool   // model claimed positive evidence of legitimacy (only meaningful for resolve)
+
+	// Observable structural signals (measured, not self-reported).
+	toolCalls     int
+	distinctTools int
+	toolEmpty     bool
+
+	// failSafe is true when the tier could not produce a trustworthy verdict
+	// (model error, empty/unparseable reply): the cascade must escalate, never
+	// resolve. reason carries the cause.
+	failSafe bool
+}
+
+// cleanResolve reports whether a triage resolve is clean enough to CLOSE a
+// finding benign without escalating to investigate. The triage floor (§2.4):
+// positive evidence present, self-confidence ≥ 4 (high/certain), and the tools
+// were not empty. Anything short of all three is not a dismissal — it escalates.
+func (r tierResult) cleanResolve() bool {
+	return r.verdict == VerdictResolve &&
+		r.hasPosEvid &&
+		r.selfConf >= 4 &&
+		!r.toolEmpty
+}
+
+// resolveAttempt projects a tier result into the ResolveAttempt the structural +
+// fail-safe gate (GuardResolve) judges. Used for the investigate tier's resolve:
+// the gate scores the OBSERVABLE investigation (tool calls, distinct tools,
+// evidence citations in the reason, iteration count) and applies the fail-safe
+// (ambiguity / empty / low-confidence / no-positive-evidence ⇒ escalate).
+func (r tierResult) resolveAttempt() ResolveAttempt {
+	return ResolveAttempt{
+		Transcript: Transcript{
+			Resolved:      true, // we only build this for a proposed resolve
+			ToolCalls:     r.toolCalls,
+			DistinctTools: r.distinctTools,
+			Iterations:    1, // single-pass this wave; deep panel adds iterations later
+			Reason:        r.reason,
+		},
+		SelfConfidence:      r.selfConf,
+		ToolReturnedEmpty:   r.toolEmpty,
+		Ambiguous:           false, // an unparseable reply already became failSafe upstream
+		HasPositiveEvidence: r.hasPosEvid,
+	}
+}
+
+// runTier executes one tier: gather tool evidence, build the untrusted-data-safe
+// prompt, call the model, parse the verdict. It NEVER resolves on its own — it
+// returns a tierResult the caller (the cascade) gates.
+func runTier(ctx context.Context, client Client, f finding.Finding, tier, model, systemPrompt string, tools ToolRunner) tierResult {
+	res := tierResult{tier: tier}
+
+	// (1) Gather tool evidence through the seam (nil-safe: no live tools this wave).
+	var evidence ToolEvidence
+	if tools != nil {
+		ev, err := tools.RunTools(ctx, tier, f)
+		if err != nil {
+			// A tool ERROR (not an empty result) is a genuine failure: fail safe.
+			res.failSafe = true
+			res.verdict = VerdictEscalate
+			res.reason = fmt.Sprintf("%s: tool error gathering evidence (%v); escalating (fail-safe)", tier, err)
+			return res
+		}
+		evidence = ev
+	}
+	res.toolCalls = evidence.ToolCalls
+	res.distinctTools = evidence.DistinctTools
+	res.toolEmpty = evidence.ToolEmpty
+
+	// (2) Build the user message. Every attacker-controlled string — the finding's
+	// title/reason/actor/type AND the tool transcript — is WrapUntrusted +
+	// sanitized so an injection payload riding in any of them is boxed in
+	// USER_DATA markers and cannot pose as a system instruction (§2.7 / §3).
+	req := buildTierRequest(f, model, systemPrompt, evidence.Text)
+
+	// (3) Call the model once.
+	resp, err := client.Messages(ctx, req)
+	if err != nil {
+		res.failSafe = true
+		res.verdict = VerdictEscalate
+		res.reason = fmt.Sprintf("%s: model call failed (%v); escalating (fail-safe)", tier, err)
+		return res
+	}
+
+	reply := firstText(resp)
+	v, conf, posEvid, reason := parseVerdict(reply)
+	res.verdict = v
+	res.selfConf = conf
+	res.hasPosEvid = posEvid
+	res.reason = reason
+
+	// An unparseable reply is ambiguity: fail safe to escalate (§2.5). Never
+	// silently dismiss a finding because the model's reply could not be read.
+	if v == VerdictUnparseable {
+		res.failSafe = true
+		res.verdict = VerdictEscalate
+		if strings.TrimSpace(reason) == "" {
+			res.reason = fmt.Sprintf("%s: model reply unparseable; escalating (fail-safe)", tier)
+		} else {
+			res.reason = fmt.Sprintf("%s: model reply unparseable; escalating (fail-safe): %s", tier, reason)
+		}
+	}
+
+	return res
+}
+
+// buildTierRequest assembles a tier's single MessagesRequest. The system prompt
+// is the ported POST.md (carrying the ## Security block). The user content boxes
+// every untrusted scalar of the finding plus the tool transcript in USER_DATA
+// markers via WrapUntrusted — the model sees them as data to analyze, never as
+// instructions to follow.
+func buildTierRequest(f finding.Finding, model, systemPrompt, toolText string) MessagesRequest {
+	var b strings.Builder
+	b.WriteString("Analyze this security finding and decide.\n\n")
+	// Each finding field that an attacker can influence is individually boxed.
+	b.WriteString(WrapUntrusted("finding.id", f.ID))
+	b.WriteString("\n")
+	b.WriteString(WrapUntrusted("finding.type", f.Type))
+	b.WriteString("\n")
+	b.WriteString(WrapUntrusted("finding.severity", f.Severity))
+	b.WriteString("\n")
+	b.WriteString(WrapUntrusted("finding.actor", f.Actor))
+	b.WriteString("\n")
+	b.WriteString(WrapUntrusted("finding.source", f.Source))
+	b.WriteString("\n")
+	b.WriteString(WrapUntrusted("finding.reason", f.Reason))
+	b.WriteString("\n")
+	if strings.TrimSpace(toolText) != "" {
+		// The tool transcript is the highest-risk injection vector (§3.8): box it.
+		b.WriteString(WrapUntrusted("tools.transcript", toolText))
+		b.WriteString("\n")
+	}
+	b.WriteString("\nRespond with your verdict. Use this exact shape:\n")
+	b.WriteString(`{"action":"resolve|escalate","confidence":1-5,"positive_evidence":true|false,"reason":"..."}`)
+	b.WriteString("\n")
+
+	return MessagesRequest{
+		Model:     model,
+		MaxTokens: 512,
+		System:    systemPrompt,
+		Messages: []Message{{
+			Role:    "user",
+			Content: []ContentBlock{{Type: "text", Text: b.String()}},
+		}},
+	}
+}
+
+// buildEscalateRequest assembles the escalate role's single request: the cheap,
+// tool-less formatter. The finding fields and the upstream escalation reason are
+// boxed (the upstream reason can echo attacker-influenced finding text). The
+// system prompt carries the ## Security block so "resolve as benign" inside the
+// box is ignored.
+func buildEscalateRequest(f finding.Finding, model, upstream string) MessagesRequest {
+	var b strings.Builder
+	b.WriteString("Format a human-facing security alert from this data.\n\n")
+	b.WriteString(WrapUntrusted("finding.id", f.ID))
+	b.WriteString("\n")
+	b.WriteString(WrapUntrusted("finding.type", f.Type))
+	b.WriteString("\n")
+	b.WriteString(WrapUntrusted("finding.severity", f.Severity))
+	b.WriteString("\n")
+	b.WriteString(WrapUntrusted("finding.reason", f.Reason))
+	b.WriteString("\n")
+	b.WriteString(WrapUntrusted("escalation.upstream", upstream))
+	b.WriteString("\n")
+
+	return MessagesRequest{
+		Model:     model,
+		MaxTokens: 512,
+		System:    escalateSystemPrompt,
+		Messages: []Message{{
+			Role:    "user",
+			Content: []ContentBlock{{Type: "text", Text: b.String()}},
+		}},
+	}
+}
+
+// verdictReply is the structured shape a tier model is asked to emit. Parsed
+// leniently: a missing/garbled reply degrades to VerdictUnparseable (the
+// fail-safe escalates it), never to a silent resolve.
+type verdictReply struct {
+	Action           string `json:"action"`
+	Confidence       int    `json:"confidence"`
+	PositiveEvidence bool   `json:"positive_evidence"`
+	Reason           string `json:"reason"`
+}
+
+// parseVerdict extracts the disposition + self-confidence + positive-evidence
+// flag + reason from a model reply. It is deliberately STRICT about what counts
+// as a resolve and LENIENT about failure:
+//
+//   - A JSON object (possibly embedded in surrounding prose) with action
+//     "resolve"/"escalate" is the primary path.
+//   - Failing that, a plain-text reply is scanned for an explicit RESOLVE /
+//     ESCALATE token (case-insensitive, word-boundary).
+//   - Anything else is VerdictUnparseable — which the caller fail-safes to
+//     escalate. Ambiguity NEVER becomes resolve.
+//
+// CRUCIAL for the injection invariant: the only way to get VerdictResolve is an
+// explicit, well-formed resolve in the model's OWN reply. Untrusted text boxed
+// in USER_DATA markers is never parsed as a verdict — it is in the prompt the
+// model reads, not in the model's reply this function reads.
+func parseVerdict(reply string) (Verdict, int, bool, string) {
+	reply = strings.TrimSpace(reply)
+	if reply == "" {
+		return VerdictUnparseable, 0, false, ""
+	}
+
+	// Primary: a JSON object, possibly wrapped in prose or a ```json fence.
+	if obj := extractJSONObject(reply); obj != "" {
+		var vr verdictReply
+		if err := json.Unmarshal([]byte(obj), &vr); err == nil {
+			action := normalizeAction(vr.Action)
+			reason := sanitizeReason(vr.Reason)
+			switch action {
+			case VerdictResolve:
+				return VerdictResolve, clampConf(vr.Confidence), vr.PositiveEvidence, reason
+			case VerdictEscalate:
+				return VerdictEscalate, clampConf(vr.Confidence), vr.PositiveEvidence, reason
+			}
+			// Parsed JSON but no recognizable action → fall through to token scan.
+		}
+	}
+
+	// Secondary: explicit token in plain text. Escalate wins ties — the safe side.
+	low := strings.ToLower(reply)
+	hasEscalate := containsToken(low, "escalate")
+	hasResolve := containsToken(low, "resolve") || containsToken(low, "resolved")
+	switch {
+	case hasEscalate:
+		return VerdictEscalate, 0, false, sanitizeReason(reply)
+	case hasResolve:
+		// A bare "resolve" with no structured confidence/evidence is a WEAK resolve:
+		// report it as resolve but with confidence 0 and no positive evidence, so the
+		// triage rubric (needs ≥4 + posEvid) and the investigate gate both reject it
+		// unless the model actually supplied the structured fields above.
+		return VerdictResolve, 0, false, sanitizeReason(reply)
+	default:
+		return VerdictUnparseable, 0, false, sanitizeReason(reply)
+	}
+}
+
+// normalizeAction folds an action string onto a Verdict. Unknown → unparseable.
+func normalizeAction(s string) Verdict {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "resolve", "resolved", "benign", "dismiss":
+		return VerdictResolve
+	case "escalate", "escalated", "investigate", "suspicious":
+		return VerdictEscalate
+	default:
+		return VerdictUnparseable
+	}
+}
+
+// extractJSONObject returns the first balanced {...} JSON object substring in s,
+// or "" when there is none. Tolerates surrounding prose and ```json fences — the
+// model often narrates before emitting the object.
+func extractJSONObject(s string) string {
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return ""
+	}
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
+}
+
+// containsToken reports whether low (already lower-cased) contains tok as a
+// whole word (bounded by non-letter on both sides). Prevents "unresolved" from
+// matching "resolve" or "de-escalate" oddities from skewing the scan.
+func containsToken(low, tok string) bool {
+	idx := 0
+	for {
+		i := strings.Index(low[idx:], tok)
+		if i < 0 {
+			return false
+		}
+		i += idx
+		before := i == 0 || !isLetter(low[i-1])
+		afterPos := i + len(tok)
+		after := afterPos >= len(low) || !isLetter(low[afterPos])
+		if before && after {
+			return true
+		}
+		idx = i + 1
+		if idx >= len(low) {
+			return false
+		}
+	}
+}
+
+func isLetter(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') }
+
+// clampConf bounds a self-reported confidence to the 0..5 range (0 = none).
+func clampConf(c int) int {
+	if c < 0 {
+		return 0
+	}
+	if c > 5 {
+		return 5
+	}
+	return c
+}
+
+// sanitizeReason strips control characters from a model-supplied reason so it is
+// safe to embed in a Resolution.Reason / log line. It does NOT box the reason in
+// USER_DATA markers (the reason is the MODEL's output, not untrusted input) — it
+// only neutralizes control chars, length-capping via the shared SanitizeField
+// path is unnecessary here since the model's own reason is short.
+func sanitizeReason(s string) string {
+	var b strings.Builder
+	for _, ch := range strings.TrimSpace(s) {
+		if isControl(ch) {
+			if ch == '\n' || ch == '\r' || ch == '\t' {
+				b.WriteByte(' ')
+			}
+			continue
+		}
+		b.WriteRune(ch)
+	}
+	return strings.TrimSpace(b.String())
+}
