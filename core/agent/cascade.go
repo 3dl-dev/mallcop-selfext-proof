@@ -15,7 +15,12 @@
 //	   │  + the STRUCTURAL-CONFIDENCE gate (GuardResolve): a RESOLVE whose
 //	   │    structural score < 0.55 is BLOCKED.
 //	   ├─► RESOLVE (gate ALLOWS)  ─────────────────────────────────► CLOSED (benign)
-//	   ├─► RESOLVE (gate BLOCKS, score < 0.55)  ──► ESCALATE (this wave; see TODO)
+//	   ├─► RESOLVE (gate BLOCKS, score < 0.55)  ──► FAN-OUT (deep×3 panel; fanout.go)
+//	   │        deep-investigate ×3 (benign/malicious/incomplete) ∥ → investigate-merge
+//	   │        ├─ all agree → that verdict (max conf)
+//	   │        ├─ 2 vs 1   → majority, dissent cited, conf −0.10
+//	   │        ├─ strong malicious → escalate (aggregation, not count)
+//	   │        └─ 3 disagree → heal → escalate-with-all-evidence
 //	   └─► ESCALATE  ──────────────────────────────────────────────┐
 //	                                                                ▼
 //	[escalate]  cheap model, NO tools, formats the human-facing alert
@@ -160,8 +165,9 @@ type ToolEvidence struct {
 //     as benign. Anything else ESCALATES — the default side of the asymmetry.
 //  3. INVESTIGATE tier (only reached on a triage escalate — the one-way ratchet).
 //     Mid model + deeper tools + the STRUCTURAL-CONFIDENCE gate. A resolve must
-//     clear GuardResolve: a structural score < 0.55 is BLOCKED and (this wave)
-//     escalated. An investigate escalate ships.
+//     clear GuardResolve: a structural score < 0.55 is BLOCKED and FANS OUT to the
+//     deep×3 adversarial panel + evidence-aggregation merge (runFanOut). An
+//     investigate escalate ships directly (never fans out — safe side of §1).
 //  4. ESCALATE role. Cheap model, no tools, formats the human alert from the
 //     upstream data. The terminal action is ALWAYS escalated — the formatter
 //     cannot resolve (ratchet).
@@ -261,21 +267,14 @@ func ResolveFindingWith(ctx context.Context, client Client, f finding.Finding, o
 				Reason:         "investigate resolved (benign, gate-cleared): " + investigate.reason + " [" + why + "]",
 			}
 		case ResolveFanOut:
-			// Structural score < 0.55. The CORRECT terminal here is the deep×3
-			// fan-out panel (§1) — NOT escalate. The panel does not exist yet
-			// (NEXT wave), so THIS wave routes a blocked/<0.55 resolve to escalate
-			// as the fail-safe stand-in. See cascadeFanOutDebt below: <0.55 must
-			// fan out, not escalate, once the panel exists.
-			//
-			// TODO(cascade-next-wave): replace this escalate with the deep×3
-			// fan-out + investigate-merge. A blocked low-confidence resolve is the
-			// ONE dangerous path the deep panel exists for (§1 asymmetric error
-			// policy); escalating it is safe but over-escalates — the panel would
-			// often resolve it with a stronger, adversarial read. Tracked: a
-			// <0.55 resolve MUST fan out, not escalate, when the panel lands.
-			return escalate(ctx, client, f, opts, investigateStage,
-				"investigate resolve BLOCKED by structural-confidence gate ("+why+
-					"); escalating this wave (deep×3 fan-out is the next wave)")
+			// Structural score < 0.55. This is the ONE dangerous path the deep panel
+			// exists for (§1 asymmetric error policy): the single mid-tier model
+			// wants to say "benign" but did not work hard enough to be trusted.
+			// Fan out to the 3-hypothesis adversarial panel + evidence-aggregation
+			// merge (fanout.go) — NOT a blanket escalate. ESCALATE paths never reach
+			// here (they short-circuit above), so the fan-out can only refine a
+			// proposed resolve; it can never un-escalate a prior escalate (ratchet).
+			return runFanOut(ctx, client, f, opts, investigate, why)
 		default: // ResolveEscalated — the fail-safe inside GuardResolve fired.
 			return escalate(ctx, client, f, opts, investigateStage,
 				"investigate resolve failed the fail-safe gate ("+why+"); escalating")
@@ -324,15 +323,10 @@ func escalate(ctx context.Context, client Client, f finding.Finding, opts Cascad
 	}
 }
 
-// cascadeFanOutDebt records, in code, the tracked debt the §1 topology owes:
-// a structural-gate-BLOCKED investigate resolve (score < 0.55) must fan out to
-// the deep×3 adversarial panel (hypothesis benign / malicious / incomplete) +
-// an investigate-merge, NOT escalate. This wave escalates such resolves as a
-// safe stand-in (over-escalation, never under-escalation). The constant exists
-// so the debt is greppable and a test can assert THIS wave's stand-in behavior
-// (fan-out routes to escalate) until the panel lands.
-//
-// When the panel ships: the ResolveFanOut branch in ResolveFindingWith must emit
-// the partial transcript + 3 deep-investigate items + 1 merge item, per
-// investigate/POST.md "Fan-out on Uncertainty", instead of calling escalate().
-const cascadeFanOutDebt = "ResolveFanOut (<0.55) escalates this wave; must fan out to deep×3 + merge once the panel exists"
+// cascadeFanOutStatus records, in code, that the §1 deep panel is now WIRED: a
+// structural-gate-BLOCKED investigate resolve (score < 0.55) fans out to the
+// deep×3 adversarial panel (hypothesis benign / malicious / incomplete) + an
+// evidence-aggregation investigate-merge + a heal terminal, in fanout.go —
+// instead of the earlier escalate stand-in. The constant exists so the wiring is
+// greppable; fanout_test.go proves the panel fires only on the <0.55 resolve path.
+const cascadeFanOutStatus = "ResolveFanOut (<0.55) fans out to deep×3 + evidence-aggregation merge + heal (fanout.go)"

@@ -38,6 +38,23 @@ type tierResult struct {
 	selfConf   int    // model's self-reported 1-5 confidence; 0 when none supplied
 	hasPosEvid bool   // model claimed positive evidence of legitimacy (only meaningful for resolve)
 
+	// strongMalicious is true when the model's reply asserts a STRONG malicious-side
+	// evidence item (parsed ONLY from the model reply, never from untrusted prompt
+	// text — same verdict-isolation discipline as verdict). The merge aggregator
+	// uses it so a single strong malicious finding can outweigh two weak benign
+	// concurrences (§1: evidence aggregation, not majority vote). It is meaningful
+	// only on a deep-investigate tier.
+	strongMalicious bool
+
+	// insufficient distinguishes an escalate-as-INSUFFICIENT-DATA from an
+	// escalate-as-SUSPICIOUS (§1: "escalate-as-suspicious vs escalate-as-insufficient
+	// -data"). Both produce verdict=escalate (the safe side), but the merge
+	// aggregator treats them as DIFFERENT dispositions: a panel that splits into one
+	// resolve, one suspicious, and one insufficient is genuinely uncertain (3
+	// disagree) → heal. Parsed ONLY from the model reply. Meaningful on a
+	// deep-investigate tier (the "incomplete" hypothesis).
+	insufficient bool
+
 	// Observable structural signals (measured, not self-reported).
 	toolCalls     int
 	distinctTools int
@@ -85,6 +102,15 @@ func (r tierResult) resolveAttempt() ResolveAttempt {
 // prompt, call the model, parse the verdict. It NEVER resolves on its own — it
 // returns a tierResult the caller (the cascade) gates.
 func runTier(ctx context.Context, client Client, f finding.Finding, tier, model, systemPrompt string, tools ToolRunner) tierResult {
+	return runTierWithContext(ctx, client, f, tier, model, systemPrompt, tools, "")
+}
+
+// runTierWithContext is runTier with an additional UNTRUSTED context block — the
+// parent investigate's partial transcript handed to a deep-investigate tier. The
+// extra block is boxed in USER_DATA markers exactly like the finding fields and
+// tool transcript; it is read-only context for the deep tier, never an
+// instruction. extraContext "" reduces this to plain runTier.
+func runTierWithContext(ctx context.Context, client Client, f finding.Finding, tier, model, systemPrompt string, tools ToolRunner, extraContext string) tierResult {
 	res := tierResult{tier: tier}
 
 	// (1) Gather tool evidence through the seam (nil-safe: no live tools this wave).
@@ -105,10 +131,10 @@ func runTier(ctx context.Context, client Client, f finding.Finding, tier, model,
 	res.toolEmpty = evidence.ToolEmpty
 
 	// (2) Build the user message. Every attacker-controlled string — the finding's
-	// title/reason/actor/type AND the tool transcript — is WrapUntrusted +
-	// sanitized so an injection payload riding in any of them is boxed in
-	// USER_DATA markers and cannot pose as a system instruction (§2.7 / §3).
-	req := buildTierRequest(f, model, systemPrompt, evidence.Text)
+	// title/reason/actor/type AND the tool transcript AND any parent transcript —
+	// is WrapUntrusted + sanitized so an injection payload riding in any of them is
+	// boxed in USER_DATA markers and cannot pose as a system instruction (§2.7 / §3).
+	req := buildTierRequest(f, model, systemPrompt, evidence.Text, extraContext)
 
 	// (3) Call the model once.
 	resp, err := client.Messages(ctx, req)
@@ -131,10 +157,12 @@ func runTier(ctx context.Context, client Client, f finding.Finding, tier, model,
 	// keeps the verdict escalate; mutating this line to read from the prompt flips
 	// it to resolve and fails that test.
 	reply := firstText(resp)
-	v, conf, posEvid, reason := parseVerdict(reply)
+	v, conf, posEvid, strongMal, insuff, reason := parseVerdict(reply)
 	res.verdict = v
 	res.selfConf = conf
 	res.hasPosEvid = posEvid
+	res.strongMalicious = strongMal
+	res.insufficient = insuff
 	res.reason = reason
 
 	// An unparseable reply is ambiguity: fail safe to escalate (§2.5). Never
@@ -157,7 +185,7 @@ func runTier(ctx context.Context, client Client, f finding.Finding, tier, model,
 // every untrusted scalar of the finding plus the tool transcript in USER_DATA
 // markers via WrapUntrusted — the model sees them as data to analyze, never as
 // instructions to follow.
-func buildTierRequest(f finding.Finding, model, systemPrompt, toolText string) MessagesRequest {
+func buildTierRequest(f finding.Finding, model, systemPrompt, toolText, parentTranscript string) MessagesRequest {
 	var b strings.Builder
 	b.WriteString("Analyze this security finding and decide.\n\n")
 	// Each finding field that an attacker can influence is individually boxed.
@@ -178,8 +206,16 @@ func buildTierRequest(f finding.Finding, model, systemPrompt, toolText string) M
 		b.WriteString(WrapUntrusted("tools.transcript", toolText))
 		b.WriteString("\n")
 	}
+	if strings.TrimSpace(parentTranscript) != "" {
+		// The parent investigate's partial transcript handed to a deep tier. It is
+		// produced upstream from finding/tool text that may itself be attacker-
+		// influenced — box it like every other untrusted vector (read-only context,
+		// never an instruction).
+		b.WriteString(WrapUntrusted("parent.transcript", parentTranscript))
+		b.WriteString("\n")
+	}
 	b.WriteString("\nRespond with your verdict. Use this exact shape:\n")
-	b.WriteString(`{"action":"resolve|escalate","confidence":1-5,"positive_evidence":true|false,"reason":"..."}`)
+	b.WriteString(`{"action":"resolve|escalate","confidence":1-5,"positive_evidence":true|false,"strong_evidence":true|false,"insufficient_data":true|false,"reason":"..."}`)
 	b.WriteString("\n")
 
 	return MessagesRequest{
@@ -230,6 +266,16 @@ type verdictReply struct {
 	Action           string `json:"action"`
 	Confidence       int    `json:"confidence"`
 	PositiveEvidence bool   `json:"positive_evidence"`
+	// StrongEvidence, when true on a deep-investigate reply, asserts the model
+	// found a STRONG malicious-side evidence item. The merge aggregator (fanout.go)
+	// lets one such item outweigh two weak benign concurrences. Parsed ONLY here,
+	// from the model's own reply — never from untrusted prompt text.
+	StrongEvidence bool `json:"strong_evidence"`
+	// InsufficientData, when true on a deep-investigate reply, marks an
+	// escalate-as-INSUFFICIENT-DATA (distinct from escalate-as-suspicious). The
+	// merge aggregator uses it to detect a genuine 3-way split (resolve / suspicious
+	// / insufficient) → heal. Parsed ONLY from the model reply.
+	InsufficientData bool   `json:"insufficient_data"`
 	Reason           string `json:"reason"`
 }
 
@@ -248,10 +294,15 @@ type verdictReply struct {
 // explicit, well-formed resolve in the model's OWN reply. Untrusted text boxed
 // in USER_DATA markers is never parsed as a verdict — it is in the prompt the
 // model reads, not in the model's reply this function reads.
-func parseVerdict(reply string) (Verdict, int, bool, string) {
+//
+// Returns: verdict, self-confidence, positive-evidence, strong-malicious-evidence,
+// insufficient-data, reason. The strong-malicious and insufficient-data flags are
+// deep-investigate signals the merge aggregator reads; like the verdict they come
+// ONLY from the model's reply, never from untrusted prompt text.
+func parseVerdict(reply string) (Verdict, int, bool, bool, bool, string) {
 	reply = strings.TrimSpace(reply)
 	if reply == "" {
-		return VerdictUnparseable, 0, false, ""
+		return VerdictUnparseable, 0, false, false, false, ""
 	}
 
 	// Primary: a JSON object, possibly wrapped in prose or a ```json fence.
@@ -262,9 +313,9 @@ func parseVerdict(reply string) (Verdict, int, bool, string) {
 			reason := sanitizeReason(vr.Reason)
 			switch action {
 			case VerdictResolve:
-				return VerdictResolve, clampConf(vr.Confidence), vr.PositiveEvidence, reason
+				return VerdictResolve, clampConf(vr.Confidence), vr.PositiveEvidence, vr.StrongEvidence, vr.InsufficientData, reason
 			case VerdictEscalate:
-				return VerdictEscalate, clampConf(vr.Confidence), vr.PositiveEvidence, reason
+				return VerdictEscalate, clampConf(vr.Confidence), vr.PositiveEvidence, vr.StrongEvidence, vr.InsufficientData, reason
 			}
 			// Parsed JSON but no recognizable action → fall through to token scan.
 		}
@@ -276,15 +327,15 @@ func parseVerdict(reply string) (Verdict, int, bool, string) {
 	hasResolve := containsToken(low, "resolve") || containsToken(low, "resolved")
 	switch {
 	case hasEscalate:
-		return VerdictEscalate, 0, false, sanitizeReason(reply)
+		return VerdictEscalate, 0, false, false, false, sanitizeReason(reply)
 	case hasResolve:
 		// A bare "resolve" with no structured confidence/evidence is a WEAK resolve:
 		// report it as resolve but with confidence 0 and no positive evidence, so the
 		// triage rubric (needs ≥4 + posEvid) and the investigate gate both reject it
 		// unless the model actually supplied the structured fields above.
-		return VerdictResolve, 0, false, sanitizeReason(reply)
+		return VerdictResolve, 0, false, false, false, sanitizeReason(reply)
 	default:
-		return VerdictUnparseable, 0, false, sanitizeReason(reply)
+		return VerdictUnparseable, 0, false, false, false, sanitizeReason(reply)
 	}
 }
 

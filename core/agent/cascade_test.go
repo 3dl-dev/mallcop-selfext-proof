@@ -548,39 +548,29 @@ func TestCascade_OneWayRatchet_DownstreamCannotUnescalate(t *testing.T) {
 
 	// Triage escalates. Investigate then tries to RESOLVE with a high self-reported
 	// confidence but a SHALLOW investigation (the scriptedTools below report only 1
-	// tool call / 1 distinct tool and a reason with no concrete evidence citations)
-	// — the structural-confidence gate scores it < 0.55 and BLOCKS the resolve.
-	// This wave routes a blocked resolve to escalate. The ratchet holds: triage's
-	// escalate is never flipped to a terminal resolve.
-	script := func(callIndex int) string {
-		switch callIndex {
-		case 0: // triage escalate
-			return `{"action":"escalate","confidence":3,"positive_evidence":false,"reason":"needs deeper look"}`
-		case 1: // investigate tries to resolve, claiming certainty — but shallowly
-			return `{"action":"resolve","confidence":5,"positive_evidence":true,"reason":"looks fine to me"}`
-		case 2: // escalate formatter
-			return "SECURITY ALERT: low-confidence resolve blocked by structural gate; analyst review."
-		default:
-			t.Fatalf("ratchet scenario made an unexpected extra model call #%d", callIndex)
-			return ""
-		}
-	}
-	client, be := startBackend(t, script)
+	// tool call / 1 distinct tool) — the structural-confidence gate scores it < 0.55
+	// and BLOCKS the resolve, fanning out to the deep panel. The deep panel here
+	// surfaces a STRONG malicious indicator, so it escalates. The ratchet holds even
+	// THROUGH the fan-out: a shallow downstream resolve is never flipped to a
+	// terminal resolve.
+	//
+	// Uses the content-aware panel backend (cascade_test.go's call-index script
+	// cannot vary the 3 concurrent deep tiers' verdicts).
+	be := newPanelBackend().withFanOutLeadIn()
+	be.deep["benign"] = `{"action":"resolve","confidence":2,"positive_evidence":true,"reason":"actor is known."}`
+	be.deep["incomplete"] = `{"action":"resolve","confidence":2,"positive_evidence":true,"reason":"no obvious data gap."}`
+	be.deep["malicious"] = `{"action":"escalate","confidence":5,"positive_evidence":false,"strong_evidence":true,"reason":"DECISIVE: lateral movement to a sibling resource with a freshly-minted persistent token — credential-theft signature."}`
 
 	f := finding.Finding{ID: "URA-02", Type: "lateral-movement", Severity: "high", Actor: "svc-x", Source: "aws", Reason: "sibling-resource rotation"}
-	// Shallow tools: 1 call, 1 distinct tool → low structural score.
 	opts := agent.CascadeOptions{Tools: scriptedTools{text: "events: one event", toolCalls: 1, distinctTools: 1}}
 
-	res := agent.ResolveFindingWith(context.Background(), client, f, opts)
+	res := agent.ResolveFindingWith(context.Background(), be, f, opts)
 
 	if res.Action != agent.ActionEscalated {
 		t.Fatalf("RATCHET BROKEN: a shallow downstream resolve flipped a triage-escalated finding back to %q (reason=%q)", res.Action, res.Reason)
 	}
-	if be.CallCount() != 3 {
-		t.Fatalf("ratchet scenario should run triage→investigate→escalate (3 calls); got %d", be.CallCount())
-	}
-	if !strings.Contains(res.Reason, "SECURITY ALERT") {
-		t.Fatalf("terminal reason should be the escalate role alert; got %q", res.Reason)
+	if got := be.distinctDeepHypotheses(); len(got) != 3 {
+		t.Fatalf("a blocked resolve must fan out to the 3-hypothesis panel; saw %d distinct hypotheses (%v)", len(got), got)
 	}
 }
 
@@ -631,40 +621,37 @@ func TestCascade_InvestigateResolve_ClearsStructuralGate(t *testing.T) {
 }
 
 // --- STRUCTURAL GATE BLOCK: a SHALLOW investigate resolve is blocked (<0.55) and
-// (this wave) escalates — the deep×3 fan-out is the NEXT wave. ------------------
+// FANS OUT to the deep×3 panel (no longer escalates directly). The exhaustive
+// fan-out behavior is in fanout_test.go; this test pins the cascade-level wiring:
+// the gate's ResolveFanOut decision reaches the deep panel. --------------------
 
-func TestCascade_InvestigateResolve_BlockedByStructuralGate_EscalatesThisWave(t *testing.T) {
+func TestCascade_InvestigateResolve_BlockedByStructuralGate_FansOut(t *testing.T) {
 	useShippedCorpus(t)
 
 	// Triage escalates. Investigate RESOLVES but shallowly — 1 tool call, 1 distinct
 	// tool, a reason with no concrete citations. Structural score < 0.55: GuardResolve
-	// returns ResolveFanOut. This wave routes that to escalate (stand-in for the
-	// deep panel). The terminal action is escalated, and the reason names the gate.
-	script := func(callIndex int) string {
-		switch callIndex {
-		case 0:
-			return `{"action":"escalate","confidence":3,"positive_evidence":false,"reason":"needs a look"}`
-		case 1:
-			return `{"action":"resolve","confidence":5,"positive_evidence":true,"reason":"seems fine"}`
-		case 2:
-			return "SECURITY ALERT: low-confidence resolve blocked by the structural gate; analyst review pending deep panel."
-		default:
-			t.Fatalf("gate-block scenario made an unexpected extra model call #%d", callIndex)
-			return ""
-		}
-	}
-	client, be := startBackend(t, script)
+	// returns ResolveFanOut, and the cascade now FANS OUT to the 3-hypothesis deep
+	// panel instead of escalating directly. The panel here all-agree-benign resolves,
+	// proving the blocked resolve was routed to the panel (not the old escalate
+	// stand-in) and the panel can recover a false positive.
+	be := newPanelBackend().withFanOutLeadIn()
+	be.deep["benign"] = `{"action":"resolve","confidence":5,"positive_evidence":true,"reason":"documented vendor onboarding on 2026-03-10; baseline frequency 412; provenance traces to ticket."}`
+	be.deep["malicious"] = `{"action":"resolve","confidence":4,"positive_evidence":true,"reason":"no attack vector; source IP matches known automation."}`
+	be.deep["incomplete"] = `{"action":"resolve","confidence":4,"positive_evidence":true,"reason":"no missing data; companion events coherent."}`
 
 	f := finding.Finding{ID: "AC-01", Type: "external-access", Severity: "high", Actor: "vendor-x", Source: "okta", Reason: "external access from new trust domain"}
 	opts := agent.CascadeOptions{Tools: scriptedTools{text: "events: one", toolCalls: 1, distinctTools: 1}}
 
-	res := agent.ResolveFindingWith(context.Background(), client, f, opts)
+	res := agent.ResolveFindingWith(context.Background(), be, f, opts)
 
-	if res.Action != agent.ActionEscalated {
-		t.Fatalf("a shallow resolve must be BLOCKED by the structural gate and escalate this wave; got action=%q reason=%q", res.Action, res.Reason)
+	if got := be.distinctDeepHypotheses(); len(got) != 3 {
+		t.Fatalf("a blocked (<0.55) resolve must FAN OUT to the 3-hypothesis deep panel; saw %d distinct hypotheses (%v)", len(got), got)
 	}
-	if be.CallCount() != 3 {
-		t.Fatalf("triage-escalate → investigate-resolve(blocked) → escalate-format must be 3 model calls; got %d", be.CallCount())
+	if res.Action != agent.ActionProceed {
+		t.Fatalf("an all-agree-benign panel must resolve the false positive; got action=%q reason=%q", res.Action, res.Reason)
+	}
+	if !strings.Contains(res.Reason, "deep panel resolved") {
+		t.Fatalf("the resolution should be attributed to the deep panel; got %q", res.Reason)
 	}
 }
 
