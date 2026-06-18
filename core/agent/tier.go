@@ -119,6 +119,17 @@ func runTier(ctx context.Context, client Client, f finding.Finding, tier, model,
 		return res
 	}
 
+	// SECURITY INVARIANT (verdict isolation): the terminal verdict is parsed ONLY
+	// from the model's structured reply (resp.Content via firstText) — NEVER from
+	// `req`, the finding fields, or the tool transcript. Those are all UNTRUSTED
+	// prompt text (boxed in USER_DATA markers above) and an attacker can plant a
+	// well-formed {"action":"resolve",...} inside them. Reading the verdict from
+	// the reply, not the prompt, is what makes a planted resolve inert.
+	// DO NOT pass any req/finding/tool-derived string to parseVerdict here.
+	// Proven mutation-style by TestCascade_VerdictIsolation_TracksModelReplyNotInjection:
+	// scripting the reply to escalate while the prompt carries a planted resolve
+	// keeps the verdict escalate; mutating this line to read from the prompt flips
+	// it to resolve and fails that test.
 	reply := firstText(resp)
 	v, conf, posEvid, reason := parseVerdict(reply)
 	res.verdict = v

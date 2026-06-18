@@ -13,17 +13,61 @@ package agent
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // repoRootOverride lets tests point the floor at a temp corpus tree. When set,
 // it takes precedence over the walk. Production never sets it; the walk and the
 // MALLCOP_REPO_ROOT env fallback cover real deployments.
-var repoRootOverride string
+//
+// Guarded by repoRootMu so concurrent tests (and the -race detector) observe a
+// consistent value: the override is mutated by tests and read on every
+// resolveRepoRoot, which runs inside ResolveFinding on whatever goroutine the
+// caller uses.
+var (
+	repoRootMu       sync.RWMutex
+	repoRootOverride string
+)
 
-// setRepoRootForTest sets/clears the override. Tests defer a clear to itself.
-func setRepoRootForTest(dir string) { repoRootOverride = dir }
+// setRepoRootForTest sets/clears the override. Tests defer a clear to it.
+func setRepoRootForTest(dir string) {
+	repoRootMu.Lock()
+	repoRootOverride = dir
+	repoRootMu.Unlock()
+}
+
+// SetRepoRootForTest is the EXPORTED test-only seam. It exists so the external
+// black-box test package (agent_test, which drives the assembled cascade through
+// the public API and therefore cannot reach the unexported setRepoRootForTest)
+// can pin the floor's corpus root DETERMINISTICALLY — instead of relying on the
+// MALLCOP_REPO_ROOT env var, whose value is only honored AFTER the
+// os.Executable() walk and is therefore shadowed whenever `go test` happens to
+// place the test binary inside a marked repo tree (the non-deterministic
+// flake: the resolved root then depends on where the toolchain puts the binary,
+// flipping the cascade's corpus — and its verdicts — with zero code change).
+//
+// Pinning the override removes that ambiguity: the override is checked FIRST in
+// resolveRepoRoot, so the corpus root is whatever the test set, regardless of
+// binary placement or environment. It also lets tests avoid t.Setenv entirely
+// (which is incompatible with t.Parallel and leaks across the shared process).
+//
+// Production never calls this; the walk + env fallback cover real deployments.
+// It panics if dir is non-empty and does not contain the corpus, so a typo in a
+// test fails loudly instead of silently resolving an empty floor.
+func SetRepoRootForTest(dir string) {
+	if dir != "" {
+		if _, err := os.Stat(filepath.Join(dir, corpusRelPath)); err != nil {
+			panic(fmt.Sprintf("SetRepoRootForTest(%q): no corpus at %s: %v",
+				dir, filepath.Join(dir, corpusRelPath), err))
+		}
+	}
+	setRepoRootForTest(dir)
+	// A root change invalidates any memoized routes keyed at the old path.
+	invalidateRoutesCache()
+}
 
 // resolveRepoRoot returns the project root that holds the escalate-route corpus.
 //
@@ -36,8 +80,11 @@ func setRepoRootForTest(dir string) { repoRootOverride = dir }
 //     above it). Checked AFTER the walk so a stale env var cannot shadow a
 //     correct walk result.
 func resolveRepoRoot() (string, error) {
-	if repoRootOverride != "" {
-		return repoRootOverride, nil
+	repoRootMu.RLock()
+	override := repoRootOverride
+	repoRootMu.RUnlock()
+	if override != "" {
+		return override, nil
 	}
 
 	if exe, err := os.Executable(); err == nil {
