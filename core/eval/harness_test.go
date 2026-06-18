@@ -231,7 +231,21 @@ func TestHarness_MergeGate_GreenWithMedianOfN(t *testing.T) {
 	mustExist(t, filepath.Join(out, "report.json"))
 	mustExist(t, filepath.Join(out, "classifier.json"))
 	// Spot-check one scenario's result JSON + transcript carries real chain data.
-	sample := report.Runs[0].Results[0].ScenarioID
+	// Pick a scenario that actually REACHED the model: a force-escalated finding
+	// (e.g. the E-007/E-008 floor routes added in parity-fixes FIX 1) is escalated
+	// pre-LLM and correctly has NO model exchange — an empty transcript is the right
+	// behavior there, not a capture regression. The §4.7 "every model exchange
+	// captured" invariant is meaningful only for a finding that made model calls.
+	var sample string
+	for _, res := range report.Runs[0].Results {
+		if !res.ForceEscalated && res.ModelCalls > 0 {
+			sample = res.ScenarioID
+			break
+		}
+	}
+	if sample == "" {
+		t.Fatal("no non-force-escalated scenario with model calls to spot-check transcript capture")
+	}
 	mustExist(t, filepath.Join(out, "run-0", sample+".json"))
 	trPath := filepath.Join(out, "run-0", sample+".transcript.json")
 	mustExist(t, trPath)

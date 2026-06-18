@@ -262,7 +262,10 @@ func TestShippedCorpus_SeedsProvenRoutes(t *testing.T) {
 	invalidateRoutesCache()
 	t.Cleanup(func() { setRepoRootForTest(""); invalidateRoutesCache() })
 
-	proven := []string{"priv-escalation", "injection-probe", "log-format-drift", "boundary-violation"}
+	proven := []string{"priv-escalation", "injection-probe", "log-format-drift", "boundary-violation",
+		// E-007 / E-008 restore legion's resolution_rules.py _NEVER_AUTO_RESOLVE
+		// families dropped from the original seed (parity-fixes FIX 1).
+		"unusual-resource-access", "new-external-access"}
 	for _, fam := range proven {
 		t.Run(fam, func(t *testing.T) {
 			spy := &spyClient{t: t, failOnUse: true}
@@ -273,6 +276,56 @@ func TestShippedCorpus_SeedsProvenRoutes(t *testing.T) {
 			}
 			if spy.callCount != 0 {
 				t.Fatalf("shipped seed for %q reached the model (%d calls); must be 0", fam, spy.callCount)
+			}
+		})
+	}
+}
+
+// --- FIX 1 (restore the floor): the two _NEVER_AUTO_RESOLVE families the seed
+// dropped — unusual-resource-access (E-007) and new-external-access (E-008) —
+// now force-escalate PRE-LLM on FAMILY MATCH ALONE (no metadata predicate).
+// URA-02 and AC-02 are the malicious-hard scenarios these routes own; before the
+// fix they reached the cheap triage model and were resolved at model_calls=1.
+// The spy proves the model is NEVER called once the route fires. ----------------
+
+func TestFix1_RestoredFloorRoutes_ForceEscalatePreLLM(t *testing.T) {
+	root := repoRootFromTestFile(t)
+	setRepoRootForTest(root)
+	invalidateRoutesCache()
+	t.Cleanup(func() { setRepoRootForTest(""); invalidateRoutesCache() })
+
+	cases := []struct {
+		name       string
+		family     string
+		wantRoute  string
+	}{
+		// E-007: canonical family + each alias must all force-escalate.
+		{"URA-02/unusual-resource-access", "unusual-resource-access", "E-007"},
+		{"URA-02/lateral-movement-alias", "lateral-movement", "E-007"},
+		{"URA-02/new-resource-access-alias", "new-resource-access", "E-007"},
+		{"URA-02/resource-access-anomaly-alias", "resource-access-anomaly", "E-007"},
+		// E-008: canonical family + each alias must all force-escalate.
+		{"AC-02/new-external-access", "new-external-access", "E-008"},
+		{"AC-02/external-access-alias", "external-access", "E-008"},
+		{"AC-02/new-external-trust-alias", "new-external-trust", "E-008"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spy := &spyClient{t: t, failOnUse: true}
+			// No metadata on the finding: the route MUST fire on family alone.
+			f := finding.Finding{ID: tc.name, Type: tc.family, Severity: "high"}
+			res := ResolveFinding(context.Background(), spy, f)
+			if !res.ForceEscalated {
+				t.Fatalf("%s must force-escalate pre-LLM on family match alone; got %+v", tc.family, res)
+			}
+			if res.RouteID != tc.wantRoute {
+				t.Fatalf("%s must cite route %s; got RouteID=%q", tc.family, tc.wantRoute, res.RouteID)
+			}
+			if res.Action != ActionEscalated {
+				t.Fatalf("%s must escalate; got action=%q", tc.family, res.Action)
+			}
+			if spy.callCount != 0 {
+				t.Fatalf("%s reached the model (%d calls); the floor must short-circuit pre-LLM", tc.family, spy.callCount)
 			}
 		})
 	}
@@ -428,4 +481,25 @@ func makeFindings(n int, fam string) []finding.Finding {
 		out = append(out, finding.Finding{ID: fam, Type: fam, Severity: "critical"})
 	}
 	return out
+}
+
+// --- FIX 3 (triage prior-resolution clause, owns TD-01): the triage prompt's
+// rubric/override block must carry the same "prior resolutions don't clear new
+// incidents" override the investigate prompt already had. Before the fix the cheap
+// triage tier could close a fresh incident on the strength of a stale prior
+// resolution — exactly the TD-01 trap. ----------------------------------------
+
+func TestFix3_TriagePromptCarriesPriorResolutionClause(t *testing.T) {
+	const clause = "Prior resolutions don't clear new incidents — each is judged on its own merits"
+	if !strings.Contains(triageSystemPrompt, clause) {
+		t.Fatalf("triageSystemPrompt is missing the prior-resolution override clause (FIX 3 / TD-01):\nwant substring: %q", clause)
+	}
+	// It must sit in the rubric/override block (Step 4: Decide), next to the other
+	// non-negotiable overrides — not bolted on somewhere inert.
+	decideIdx := strings.Index(triageSystemPrompt, "### Step 4: Decide")
+	clauseIdx := strings.Index(triageSystemPrompt, clause)
+	securityIdx := strings.Index(triageSystemPrompt, "## Security")
+	if decideIdx < 0 || clauseIdx < 0 || clauseIdx < decideIdx || (securityIdx >= 0 && clauseIdx > securityIdx) {
+		t.Fatalf("the prior-resolution clause must live in the Step 4 decision/override block; decideIdx=%d clauseIdx=%d securityIdx=%d", decideIdx, clauseIdx, securityIdx)
+	}
 }

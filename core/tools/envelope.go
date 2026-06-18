@@ -27,6 +27,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // SearchEventsEnvelope is the canonical wrapped output of the search-events
@@ -56,16 +57,56 @@ type SearchEventsEnvelope struct {
 }
 
 // EventView is the per-event projection returned in the envelope. It is a flat,
-// stable view over the typed event.Event — id / source / type / actor /
-// timestamp (RFC3339, empty when zero). Payload is omitted from the view to
-// keep the envelope flat and the schema fixed; consumers that need the raw
-// payload read the store directly.
+// stable view over the typed event.Event — id / source / type / actor / target /
+// action / timestamp (RFC3339, empty when zero). The rest of the raw payload is
+// omitted to keep the envelope flat and the schema fixed; consumers that need the
+// full payload read the store directly.
+//
+// EVAL FIDELITY (FIX 4): Target and Action are projected from the event payload so
+// the model sees WHAT an event did (action) and to WHAT (target) — the same
+// per-event detail legion's academy fed its agent. Without them the portable eval
+// projected only "actor did <event_type>" and the parity number measured a model
+// blind to the relationship structure the academy showed. Each string is sanitized
+// INDIVIDUALLY (control chars stripped, length-capped) on projection so a payload
+// field cannot smuggle control bytes / unbounded text into the transcript.
 type EventView struct {
 	ID        string `json:"id"`
 	Source    string `json:"source"`
 	Type      string `json:"type"`
 	Actor     string `json:"actor"`
+	Target    string `json:"target"`
+	Action    string `json:"action"`
 	Timestamp string `json:"timestamp"`
+}
+
+// eventViewFieldCap bounds a single projected EventView string. It matches the
+// per-field discipline of the agent-side untrusted sanitizer: a payload field is
+// untrusted data and must not smuggle unbounded text into the boxed transcript.
+const eventViewFieldCap = 1024
+
+// sanitizeEventField neutralizes a single untrusted payload string for inclusion
+// in an EventView: control characters are dropped (newline/tab/CR collapse to a
+// space so the compact transcript stays one-line-per-event), and the result is
+// length-capped. Each EventView string is sanitized through this INDIVIDUALLY
+// (FIX 4) — never as one concatenated blob — so one field cannot bleed into another.
+func sanitizeEventField(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			b.WriteByte(' ')
+		case r < 0x20 || r == 0x7f:
+			// drop other control characters entirely
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	if len(out) > eventViewFieldCap {
+		out = out[:eventViewFieldCap]
+	}
+	return out
 }
 
 // FilterApplied echoes the filter that actually constrained the result. Actor /

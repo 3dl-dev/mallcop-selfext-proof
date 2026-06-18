@@ -153,6 +153,135 @@ func TestCascade_BenignResolvesAtTriage(t *testing.T) {
 	}
 }
 
+// --- FIX 2: a clean triage RESOLVE on a RISKY finding does NOT terminate at
+// triage — it is forced to investigate (model_calls>1). This is the structural
+// defect that owned the 9 malicious-hard under-escalations: the cheap triage model
+// self-reports confidence>=4 + positive_evidence and the OLD code closed the
+// finding at model_calls=1. ----------------------------------------------------
+
+func TestCascade_Fix2_RiskyTriageResolve_RoutesToInvestigate(t *testing.T) {
+	useShippedCorpus(t)
+
+	// Triage proposes a CLEAN resolve (confidence 5, positive_evidence true) — under
+	// the OLD code this terminates at model_calls=1. The finding is HIGH severity, so
+	// FIX 2 forbids the terminal resolve and hands off to investigate. Investigate
+	// then escalates (suspicious), proving the deeper look ran.
+	script := func(callIndex int) string {
+		switch callIndex {
+		case 0: // triage proposes a clean resolve the cheap model is "sure" of
+			return `{"action":"resolve","confidence":5,"positive_evidence":true,` +
+				`"reason":"actor is known and the access looks routine."}`
+		case 1: // investigate, given the deeper look, escalates
+			return `{"action":"escalate","confidence":4,"positive_evidence":false,` +
+				`"reason":"no positive evidence of legitimacy on a high-severity finding; recommend analyst review."}`
+		case 2: // escalate formatter
+			return "SECURITY ALERT: high-severity finding the cheap triage tier wanted to dismiss; escalated for analyst review."
+		default:
+			t.Fatalf("risky-triage-resolve scenario made an unexpected extra model call #%d", callIndex)
+			return ""
+		}
+	}
+	client, be := startBackend(t, script)
+
+	// HIGH severity, NON-floor-routed family (so it reaches the model, not the floor).
+	f := finding.Finding{
+		ID: "MAL-HARD-01", Type: "unusual-login", Severity: "high", Actor: "svc-known",
+		Source: "aws", Reason: "access to a resource",
+	}
+	opts := agent.CascadeOptions{Tools: scriptedTools{
+		text: "events: one event; baseline: actor known, frequency 5", toolCalls: 2, distinctTools: 2,
+	}}
+
+	res := agent.ResolveFindingWith(context.Background(), client, f, opts)
+
+	if res.Action != agent.ActionEscalated {
+		t.Fatalf("a risky (high-severity) triage resolve must NOT terminate benign; got action=%q reason=%q", res.Action, res.Reason)
+	}
+	if be.CallCount() <= 1 {
+		t.Fatalf("FIX 2 VIOLATED: a high-severity triage resolve terminated at model_calls=%d; it must route to investigate (model_calls>1)", be.CallCount())
+	}
+}
+
+// --- FIX 2 calibration (the OTHER side): an OBVIOUS-benign LOW-severity finding
+// the triage model cleanly resolves STILL terminates at triage (model_calls=1).
+// This proves FIX 2 is NOT a blanket-escalate-every-resolve — the cheap-triage
+// economy and benign-hard precision are preserved. ------------------------------
+
+func TestCascade_Fix2_ObviousBenignLowSeverity_StillResolvesAtTriage(t *testing.T) {
+	useShippedCorpus(t)
+
+	script := func(callIndex int) string {
+		if callIndex == 0 {
+			return `{"action":"resolve","confidence":5,"positive_evidence":true,` +
+				`"reason":"off-hours activity inside the declared maintenance window; baseline frequency 156; no privilege change."}`
+		}
+		t.Fatalf("obvious-benign scenario made an unexpected extra model call #%d — it must terminate at triage", callIndex)
+		return ""
+	}
+	client, be := startBackend(t, script)
+
+	// LOW severity, benign family, no malicious-shaped marker → obvious-benign.
+	f := finding.Finding{
+		ID: "UT-02", Type: "unusual-timing", Severity: "low", Actor: "deploy-svc",
+		Source: "azure", Reason: "off-hours activity inside maintenance window",
+	}
+	opts := agent.CascadeOptions{Tools: scriptedTools{
+		text: "events: evt_001 maintenance_window=true; baseline: deploy-svc known, frequency 156", toolCalls: 2, distinctTools: 2,
+	}}
+
+	res := agent.ResolveFindingWith(context.Background(), client, f, opts)
+
+	if res.Action != agent.ActionProceed {
+		t.Fatalf("an obvious-benign low-severity finding must STILL resolve at triage; got action=%q reason=%q", res.Action, res.Reason)
+	}
+	if be.CallCount() != 1 {
+		t.Fatalf("PRECISION/ECONOMY VIOLATED: an obvious-benign resolve must terminate at triage (1 call); got %d", be.CallCount())
+	}
+	if !strings.Contains(res.Reason, "triage resolved") {
+		t.Fatalf("an obvious-benign resolution should be attributed to triage; got %q", res.Reason)
+	}
+}
+
+// --- FIX 2: a malicious-shaped marker on a LOW-severity finding also forbids the
+// terminal triage resolve — the marker is the risk signal even when severity is low. -
+
+func TestCascade_Fix2_MaliciousMarkerLowSeverity_RoutesToInvestigate(t *testing.T) {
+	useShippedCorpus(t)
+
+	script := func(callIndex int) string {
+		switch callIndex {
+		case 0: // triage proposes a clean resolve on a finding whose reason carries an attack marker
+			return `{"action":"resolve","confidence":5,"positive_evidence":true,` +
+				`"reason":"looks routine."}`
+		case 1:
+			return `{"action":"escalate","confidence":4,"positive_evidence":false,"reason":"credential-theft signature present; escalate."}`
+		case 2:
+			return "SECURITY ALERT: credential-theft signature; escalated."
+		default:
+			t.Fatalf("malicious-marker scenario made an unexpected extra model call #%d", callIndex)
+			return ""
+		}
+	}
+	client, be := startBackend(t, script)
+
+	// LOW severity but the reason carries a malicious-shaped marker (lateral movement)
+	// on a NON-floor-routed family — FIX 2's marker signal must still escalate.
+	f := finding.Finding{
+		ID: "LM-LOW-01", Type: "unusual-login", Severity: "low", Actor: "svc-x",
+		Source: "aws", Reason: "actor performed lateral-movement to a sibling resource",
+	}
+	opts := agent.CascadeOptions{Tools: scriptedTools{text: "events: one", toolCalls: 2, distinctTools: 2}}
+
+	res := agent.ResolveFindingWith(context.Background(), client, f, opts)
+
+	if res.Action != agent.ActionEscalated {
+		t.Fatalf("a malicious-shaped marker must forbid the terminal triage resolve; got action=%q reason=%q", res.Action, res.Reason)
+	}
+	if be.CallCount() <= 1 {
+		t.Fatalf("a malicious-marker finding must route to investigate (model_calls>1); got %d", be.CallCount())
+	}
+}
+
 // --- SCENARIO 2: suspicious finding escalates through investigate (3 calls). --
 
 func TestCascade_SuspiciousEscalatesThroughInvestigate(t *testing.T) {
@@ -561,7 +690,10 @@ func TestCascade_OneWayRatchet_DownstreamCannotUnescalate(t *testing.T) {
 	be.deep["incomplete"] = `{"action":"resolve","confidence":2,"positive_evidence":true,"reason":"no obvious data gap."}`
 	be.deep["malicious"] = `{"action":"escalate","confidence":5,"positive_evidence":false,"strong_evidence":true,"reason":"DECISIVE: lateral movement to a sibling resource with a freshly-minted persistent token — credential-theft signature."}`
 
-	f := finding.Finding{ID: "URA-02", Type: "lateral-movement", Severity: "high", Actor: "svc-x", Source: "aws", Reason: "sibling-resource rotation"}
+	// Type is a NON-floor-routed family (unusual-login) so the finding reaches the
+	// model and exercises the cascade's fan-out path. (lateral-movement is now an
+	// E-007 floor route that force-escalates pre-LLM — see operator-decisions.yaml.)
+	f := finding.Finding{ID: "URA-02", Type: "unusual-login", Severity: "high", Actor: "svc-x", Source: "aws", Reason: "sibling-resource rotation"}
 	opts := agent.CascadeOptions{Tools: scriptedTools{text: "events: one event", toolCalls: 1, distinctTools: 1}}
 
 	res := agent.ResolveFindingWith(context.Background(), be, f, opts)
@@ -639,7 +771,10 @@ func TestCascade_InvestigateResolve_BlockedByStructuralGate_FansOut(t *testing.T
 	be.deep["malicious"] = `{"action":"resolve","confidence":4,"positive_evidence":true,"reason":"no attack vector; source IP matches known automation."}`
 	be.deep["incomplete"] = `{"action":"resolve","confidence":4,"positive_evidence":true,"reason":"no missing data; companion events coherent."}`
 
-	f := finding.Finding{ID: "AC-01", Type: "external-access", Severity: "high", Actor: "vendor-x", Source: "okta", Reason: "external access from new trust domain"}
+	// Type is a NON-floor-routed family (unusual-login) so the finding reaches the
+	// model and exercises the structural-gate fan-out path. (external-access is now
+	// an E-008 floor route that force-escalates pre-LLM — see operator-decisions.yaml.)
+	f := finding.Finding{ID: "AC-01", Type: "unusual-login", Severity: "high", Actor: "vendor-x", Source: "okta", Reason: "external access from new trust domain"}
 	opts := agent.CascadeOptions{Tools: scriptedTools{text: "events: one", toolCalls: 1, distinctTools: 1}}
 
 	res := agent.ResolveFindingWith(context.Background(), be, f, opts)

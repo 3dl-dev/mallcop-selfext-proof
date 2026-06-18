@@ -64,7 +64,7 @@ import (
 // When MALLCOP_RULES_SHA256 is set it overrides this constant (lets the build/
 // release process pin a corpus that wasn't yet hardcoded). Mismatch in either
 // path returns an error from LoadOperatorRules.
-const expectedOperatorRulesSHA256 = "7818b0e01d2d4f5c2ce3e4b0474a1aef4c477dedbf22c636fd0d46c432f96a2b"
+const expectedOperatorRulesSHA256 = "76d2076332601a0335f5795b38ddc99dff19d8c4b03bef88150d10fd96dd046e"
 
 // OperatorRule is a single rule loaded from operator-decisions.yaml.
 type OperatorRule struct {

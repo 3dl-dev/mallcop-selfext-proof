@@ -182,20 +182,26 @@ func loadResolutions(t *testing.T, st *store.Store) []resolution.Resolution {
 // full pipeline over a multi-finding fixture against the cannedbackend and asserts
 // the summary counts AND that resolutions land durably in the git store.
 //
-// The canned script makes the config-drift finding's triage tier RESOLVE it
-// (clean rubric: positive evidence, confidence 5, non-empty tools). The
-// injection-probe finding is force-escalated by the floor with no model call. So
-// the expected terminal split is 1 resolved + 1 escalated over 2 findings.
+// The config-drift finding is HIGH severity (MFA disabled). Under FIX 2 a clean
+// triage resolve on a high-severity finding does NOT terminate at triage — it is
+// forced to investigate, where a thorough, well-cited resolve clears the structural
+// gate and closes the finding benign. So the config-drift finding takes TWO model
+// calls (triage + investigate). The injection-probe finding is force-escalated by
+// the floor with no model call. Terminal split: 1 resolved + 1 escalated over 2
+// findings; 2 model calls total.
 func TestPipeline_EndToEnd_ConnectDetectCascadeStore(t *testing.T) {
 	useShippedCorpus(t)
 
-	// One model call per cascade-routed finding here (config-drift resolves at
-	// triage in a single call). The injection-probe finding never calls the model.
+	// Every model call returns the same thorough, well-cited resolve. Triage proposes
+	// it (forced to investigate by FIX 2 because the finding is high severity);
+	// investigate proposes it again and — with the deep tool signals below (6 calls /
+	// 4 distinct tools) — clears the structural gate, resolving benign at model_calls=2.
 	be := &cannedbackend.CannedBackend{
 		CannedResolutionFunc: func(callIndex int) string {
 			return `{"action":"resolve","confidence":5,"positive_evidence":true,` +
 				`"reason":"ops-bot disabled MFA via the documented break-glass runbook RB-114 during the ` +
-				`approved maintenance window; change ticket CHG-2231 references it; reverted at 14:40."}`
+				`approved maintenance window on 2026-03-10; baseline frequency 312 for this actor; change ` +
+				`ticket CHG-2231 references it; reverted at 14:40."}`
 		},
 	}
 	if err := be.Start(); err != nil {
@@ -214,7 +220,9 @@ func TestPipeline_EndToEnd_ConnectDetectCascadeStore(t *testing.T) {
 		Baseline:  knownActorsBaseline(),
 		Cascade: agent.CascadeOptions{Tools: fixedTools{
 			text:      "events: evt-mfa-001 mfa_disabled ops-bot 14:22; baseline: ops-bot known, 312 prior changes, break-glass runbook RB-114 on file",
-			toolCalls: 2, distinctTools: 2,
+			// Deep tool signals (6 calls / 4 distinct tools) so the investigate-tier
+			// resolve clears the structural gate (>=0.55) and need not fan out.
+			toolCalls: 6, distinctTools: 4,
 		}},
 		Workers: 4,
 	}
@@ -231,7 +239,7 @@ func TestPipeline_EndToEnd_ConnectDetectCascadeStore(t *testing.T) {
 		t.Errorf("FindingsDetected = %d, want 2 (one config-drift, one injection-probe)", sum.FindingsDetected)
 	}
 	if sum.Resolved != 1 {
-		t.Errorf("Resolved = %d, want 1 (config-drift resolved at triage)", sum.Resolved)
+		t.Errorf("Resolved = %d, want 1 (config-drift resolved at investigate after FIX 2 forced the high-severity finding past triage)", sum.Resolved)
 	}
 	if sum.Escalated != 1 {
 		t.Errorf("Escalated = %d, want 1 (injection-probe force-escalated by the floor)", sum.Escalated)
@@ -241,12 +249,13 @@ func TestPipeline_EndToEnd_ConnectDetectCascadeStore(t *testing.T) {
 			sum.Resolved, sum.Escalated, sum.FindingsDetected)
 	}
 
-	// The injection-probe finding must NOT have reached the model: only the single
-	// config-drift triage call is expected. This proves the pipeline did not bypass
-	// the cascade's pre-LLM force-escalate floor.
-	if be.CallCount() != 1 {
-		t.Errorf("model call count = %d, want 1 (injection-probe force-escalated pre-model; "+
-			"config-drift resolved in one triage call)", be.CallCount())
+	// The injection-probe finding must NOT have reached the model: the only model
+	// calls are the config-drift finding's triage + investigate (FIX 2 forces the
+	// high-severity finding past triage). This proves the pipeline did not bypass the
+	// cascade's pre-LLM force-escalate floor.
+	if be.CallCount() != 2 {
+		t.Errorf("model call count = %d, want 2 (injection-probe force-escalated pre-model; "+
+			"config-drift resolved at investigate: triage + investigate)", be.CallCount())
 	}
 
 	// Resolutions must be durably persisted to the git store and replayable.
@@ -270,8 +279,8 @@ func TestPipeline_EndToEnd_ConnectDetectCascadeStore(t *testing.T) {
 	if mfaRes.Action != "resolve" {
 		t.Errorf("config-drift resolution action = %q, want resolve", mfaRes.Action)
 	}
-	if !strings.Contains(mfaRes.Reason, "triage resolved") {
-		t.Errorf("config-drift resolution reason should be attributed to triage; got %q", mfaRes.Reason)
+	if !strings.Contains(mfaRes.Reason, "investigate resolved") {
+		t.Errorf("config-drift resolution reason should be attributed to investigate (FIX 2 forced the high-severity finding past triage); got %q", mfaRes.Reason)
 	}
 
 	var resolveCount, escalateCount int

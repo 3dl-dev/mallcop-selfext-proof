@@ -35,7 +35,7 @@ import (
 // keep the call shape identical to the production caller.
 func internalFanOutFinding() finding.Finding {
 	return finding.Finding{
-		ID: "FANOUT-INT-01", Type: "external-access", Severity: "high", Actor: "vendor-x",
+		ID: "FANOUT-INT-01", Type: "unusual-login", Severity: "high", Actor: "vendor-x",
 		Source: "okta", Reason: "external access from new trust domain",
 	}
 }

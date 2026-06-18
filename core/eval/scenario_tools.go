@@ -299,7 +299,17 @@ func writeSearchEvents(b *strings.Builder, env tools.SearchEventsEnvelope) {
 		}
 		b.WriteString(fmt.Sprintf("%d events [%s]\n", len(env.Events), strings.Join(ids, ", ")))
 		for _, e := range env.Events {
-			b.WriteString(fmt.Sprintf("  - %s %s/%s actor=%s %s\n", e.ID, e.Source, e.Type, e.Actor, e.Timestamp))
+			// EVAL FIDELITY (FIX 4): surface target + action so the model sees WHAT each
+			// event did and to WHAT — the per-event relationship detail legion's academy
+			// fed its agent. Both are already sanitized at projection (sanitizeEventField).
+			b.WriteString(fmt.Sprintf("  - %s %s/%s actor=%s", e.ID, e.Source, e.Type, e.Actor))
+			if e.Action != "" {
+				b.WriteString(" action=" + e.Action)
+			}
+			if e.Target != "" {
+				b.WriteString(" target=" + e.Target)
+			}
+			b.WriteString(" " + e.Timestamp + "\n")
 		}
 	}
 	if len(env.MatchedRules) > 0 {
@@ -335,6 +345,30 @@ func writeCheckBaseline(b *strings.Builder, actor string, bl tools.CheckBaseline
 		}
 		b.WriteString("  by_type: " + strings.Join(parts, " ") + "\n")
 	}
+	// EVAL FIDELITY (FIX 4): surface the actor↔target relationships so the model can
+	// answer "has this actor touched this target before, and how often" — the
+	// academy's relationship evidence. Deterministic key order (§4.1 reproducibility).
+	if len(bl.Relationships) > 0 {
+		keys := make([]string, 0, len(bl.Relationships))
+		for k := range bl.Relationships {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			rel := bl.Relationships[k]
+			seg := fmt.Sprintf("%s(count=%d", k, rel.Count)
+			if rel.FirstSeen != "" {
+				seg += " first_seen=" + rel.FirstSeen
+			}
+			if rel.LastSeen != "" {
+				seg += " last_seen=" + rel.LastSeen
+			}
+			seg += ")"
+			parts = append(parts, seg)
+		}
+		b.WriteString("  relationships: " + strings.Join(parts, " ") + "\n")
+	}
 }
 
 // writeSearchFindings renders the findings stream COMPACTLY: one line per finding
@@ -363,9 +397,21 @@ func baselineFromScenario(s *exam.Scenario) *baseline.Baseline {
 		KnownUsers:      map[string]baseline.UserProfile{},
 		KnownActors:     append([]string{}, s.Baseline.KnownEntities.Actors...),
 		FrequencyTables: map[string]int{},
+		Relationships:   map[string]baseline.Relationship{},
 	}
 	for k, v := range s.Baseline.FrequencyTables {
 		b.FrequencyTables[k] = v
+	}
+	// EVAL FIDELITY (FIX 4): reconstruct the scenario's relationships table into the
+	// typed baseline so check-baseline can surface the actor↔target history legion's
+	// academy fed its agent. The scenario keys an "actor:target" pair → {count,
+	// first_seen, last_seen}; mirror it verbatim.
+	for k, rel := range s.Baseline.Relationships {
+		b.Relationships[k] = baseline.Relationship{
+			Count:     rel.Count,
+			FirstSeen: rel.FirstSeen,
+			LastSeen:  rel.LastSeen,
+		}
 	}
 	// Surface known actors as profiles too, so entityKnown (which checks
 	// KnownUsers as well as KnownActors) resolves them and a last-seen lookup has

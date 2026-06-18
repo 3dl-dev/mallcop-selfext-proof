@@ -229,6 +229,7 @@ func TestCheckBaseline(t *testing.T) {
 				LastSeen:        "2026-04-09T12:00:00Z",
 				FrequencyByType: map[string]int{},
 				Roles:           []string{},
+				Relationships:   map[string]baseline.Relationship{},
 			},
 		},
 		{
@@ -240,6 +241,7 @@ func TestCheckBaseline(t *testing.T) {
 				LastSeen:        "2026-04-10T00:00:00Z",
 				FrequencyByType: map[string]int{},
 				Roles:           []string{},
+				Relationships:   map[string]baseline.Relationship{},
 			},
 		},
 		{
@@ -250,6 +252,7 @@ func TestCheckBaseline(t *testing.T) {
 				Known:           false,
 				FrequencyByType: map[string]int{},
 				Roles:           []string{},
+				Relationships:   map[string]baseline.Relationship{},
 			},
 		},
 		{
@@ -261,6 +264,7 @@ func TestCheckBaseline(t *testing.T) {
 				LastSeen:        "2026-04-09T12:00:00Z",
 				FrequencyByType: map[string]int{},
 				Roles:           []string{},
+				Relationships:   map[string]baseline.Relationship{},
 			},
 		},
 		{
@@ -272,6 +276,7 @@ func TestCheckBaseline(t *testing.T) {
 				LastSeen:        "2026-04-10T00:00:00Z",
 				FrequencyByType: map[string]int{},
 				Roles:           []string{},
+				Relationships:   map[string]baseline.Relationship{},
 			},
 		},
 		{
@@ -285,6 +290,7 @@ func TestCheckBaseline(t *testing.T) {
 				FrequencyForType: 40,
 				EventType:        "container_restart",
 				Roles:            []string{"deployer", "restarter"},
+				Relationships:    map[string]baseline.Relationship{},
 			},
 		},
 		{
@@ -295,6 +301,7 @@ func TestCheckBaseline(t *testing.T) {
 				Known:           false,
 				FrequencyByType: map[string]int{},
 				Roles:           []string{},
+				Relationships:   map[string]baseline.Relationship{},
 			},
 		},
 	}

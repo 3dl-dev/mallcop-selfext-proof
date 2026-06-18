@@ -218,17 +218,34 @@ func ResolveFindingWith(ctx context.Context, client Client, f finding.Finding, o
 		// false below), and a non-empty tool read. A clean triage resolve closes the
 		// finding as benign — triage's only terminal outcome.
 		if triage.cleanResolve() {
-			return Resolution{
-				ForceEscalated: false,
-				Action:         ActionProceed, // proceed == resolved-as-benign (terminal)
-				Family:         normalizeFamily(f.Type),
-				Reason:         "triage resolved (benign): " + triage.reason,
+			// FIX 2: a clean triage resolve may TERMINATE only on an OBVIOUS-benign
+			// finding. A RISKY proposed-resolve (high/critical severity OR a
+			// malicious-shaped structural marker) does NOT terminate at triage — the
+			// cheap glm-4.7-flash model games the self-reported confidence+evidence on
+			// real attacks. It is converted to a triage ESCALATE that hands off to
+			// investigate, so the finding gets GuardResolve + the <0.55 structural gate
+			// + the deep×3 panel before any close. Obvious-benign (low/medium, no
+			// malicious marker) STILL closes cheaply here — precision + economy preserved.
+			if mustEscalate, why := triageResolveMustEscalate(f); !mustEscalate {
+				return Resolution{
+					ForceEscalated: false,
+					Action:         ActionProceed, // proceed == resolved-as-benign (terminal)
+					Family:         normalizeFamily(f.Type),
+					Reason:         "triage resolved (benign): " + triage.reason,
+				}
+			} else {
+				// Reuse the rubric-miss handoff: force verdict=escalate so the cascade
+				// falls through to investigate (one-way ratchet, §1). The verdict is set
+				// by the RUNTIME here, never read from prompt text — verdict isolation holds.
+				triage.verdict = VerdictEscalate
+				triage.reason = "triage proposed a resolve but the finding is risky [" + why + "]; not terminating at triage: " + triage.reason
 			}
+		} else {
+			// A resolve the triage rubric did not clear is NOT a dismissal — it
+			// escalates to investigate. Default-to-escalate on ambiguity (§2.5).
+			triage.verdict = VerdictEscalate
+			triage.reason = "triage resolve did not satisfy the rubric (positive evidence + confidence ≥ 4 + non-empty tools); escalating: " + triage.reason
 		}
-		// A resolve the triage rubric did not clear is NOT a dismissal — it
-		// escalates to investigate. Default-to-escalate on ambiguity (§2.5).
-		triage.verdict = VerdictEscalate
-		triage.reason = "triage resolve did not satisfy the rubric (positive evidence + confidence ≥ 4 + non-empty tools); escalating: " + triage.reason
 	}
 
 	// (3) INVESTIGATE. The one-way ratchet: we are here ONLY because triage

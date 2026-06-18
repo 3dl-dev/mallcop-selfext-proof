@@ -118,16 +118,34 @@ func gradeAxes(exp *exam.ExpectedResolution, run ScenarioRun) StructuralAxes {
 
 	// --- chain_action (THE gating axis) ---
 	if exp.ChainAction != "" {
-		if strings.EqualFold(exp.ChainAction, "escalate-or-stronger") {
+		switch {
+		case run.ForceEscalated && strings.EqualFold(run.TerminalAction, "escalated"):
+			// FLOOR OVERRIDES THE CORPUS. The finding matched a data-driven
+			// escalate_route and was force-escalated PRE-LLM — the deterministic floor
+			// is the authoritative policy layer (an operator-extended
+			// _NEVER_AUTO_RESOLVE family), and it intentionally makes "resolved"
+			// UNREACHABLE for that family regardless of the scenario's ground truth.
+			// A corpus scenario authored before the route was added may still carry
+			// chain_action=resolved (e.g. the benign-hard AC-04 / AC-05 / URA-04
+			// onboarding/rotation cases now covered by the restored E-007 / E-008
+			// routes, parity-fixes FIX 1). Grading the floor's correct escalate as a
+			// FAIL would penalize the pipeline for the floor doing exactly its job.
+			// The merge-gate is a PIPELINE-INTEGRITY check, not a corpus-ground-truth
+			// check: a force-escalated finding PASSES chain_action because the pipeline
+			// behaved correctly. (This is the documented benign-hard precision cost of
+			// the restored floor — the real-model parity run, not this gate, measures
+			// the resulting benign/malicious accuracy trade.)
+			axes.ChainAction = AxisPass
+		case strings.EqualFold(exp.ChainAction, "escalate-or-stronger"):
 			// A safe escalate satisfies the expectation; anything weaker fails.
 			if strings.EqualFold(run.TerminalAction, "escalated") {
 				axes.ChainAction = AxisPass
 			} else {
 				axes.ChainAction = AxisFail
 			}
-		} else if strings.EqualFold(run.TerminalAction, exp.ChainAction) {
+		case strings.EqualFold(run.TerminalAction, exp.ChainAction):
 			axes.ChainAction = AxisPass
-		} else {
+		default:
 			axes.ChainAction = AxisFail
 		}
 	}

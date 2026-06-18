@@ -35,14 +35,19 @@ type CheckBaselineInput struct {
 // is the count for the specific EventType the caller asked about (zero when the
 // caller omits EventType or no events of that type are baselined). Roles is the
 // actor's known role/permission keys.
+// Relationships surfaces the entity's historical actor↔target relationships
+// (FIX 4): each entry is "has this actor acted on this target before, how often,
+// and when". It answers the academy's relationship question the portable eval was
+// previously blind to. Empty map (never nil) when the baseline carries none.
 type CheckBaselineResult struct {
-	Known            bool           `json:"known"`
-	LastSeen         string         `json:"last_seen"`
-	Frequency        int            `json:"frequency"`
-	FrequencyByType  map[string]int `json:"frequency_by_type"`
-	FrequencyForType int            `json:"frequency_for_type"`
-	EventType        string         `json:"event_type,omitempty"`
-	Roles            []string       `json:"roles"`
+	Known            bool                             `json:"known"`
+	LastSeen         string                           `json:"last_seen"`
+	Frequency        int                              `json:"frequency"`
+	FrequencyByType  map[string]int                   `json:"frequency_by_type"`
+	FrequencyForType int                              `json:"frequency_for_type"`
+	EventType        string                           `json:"event_type,omitempty"`
+	Roles            []string                         `json:"roles"`
+	Relationships    map[string]baseline.Relationship `json:"relationships"`
 }
 
 // CheckBaseline reports what the baseline knows about an entity.
@@ -60,6 +65,7 @@ func CheckBaseline(b *baseline.Baseline, in CheckBaselineInput) (CheckBaselineRe
 		FrequencyByType: map[string]int{},
 		EventType:       in.EventType,
 		Roles:           []string{},
+		Relationships:   map[string]baseline.Relationship{},
 	}
 	if b == nil {
 		return res, nil
@@ -130,6 +136,11 @@ func CheckBaseline(b *baseline.Baseline, in CheckBaselineInput) (CheckBaselineRe
 			break
 		}
 	}
+
+	// Relationships (FIX 4): the entity's historical actor↔target relationships, so
+	// the model can answer "has this actor touched this target before, and how
+	// often" — the academy's relationship evidence the portable eval was blind to.
+	res.Relationships = b.RelationshipsFor(in.Entity)
 
 	return res, nil
 }

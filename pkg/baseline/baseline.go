@@ -3,6 +3,7 @@ package baseline
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -25,6 +26,27 @@ type Baseline struct {
 	// ActorRoles maps actor → list of known role/permission keys.
 	// Used by detector-priv-escalation.
 	ActorRoles map[string][]string `json:"actor_roles,omitempty"`
+
+	// Relationships maps a relationship key (the scenario's "actor:target" shape,
+	// or any caller convention) → the historical actor↔target relationship record.
+	// EVAL FIDELITY (FIX 4): legion's academy fed its agent the scenario's
+	// relationships table so the model could answer "has this actor touched this
+	// target before, and how often". Reconstructing it here lets check-baseline
+	// surface the same relationship evidence the academy showed — without it the
+	// portable eval projected only aggregate frequencies and the parity number
+	// measured a model blind to actor↔target history.
+	Relationships map[string]Relationship `json:"relationships,omitempty"`
+}
+
+// Relationship is a historical actor↔target relationship record: how many times an
+// actor has acted on a target and the first/last time it did. Mirrors the scenario
+// baseline's relationships entry so check-baseline can surface the academy's
+// relationship evidence (FIX 4). FirstSeen/LastSeen are kept as the raw scenario
+// strings (RFC3339 in the corpus) — the tool surfaces them verbatim as evidence.
+type Relationship struct {
+	Count     int    `json:"count"`
+	FirstSeen string `json:"first_seen,omitempty"`
+	LastSeen  string `json:"last_seen,omitempty"`
 }
 
 // UserProfile captures the expected behaviour for a single actor.
@@ -118,6 +140,37 @@ func (b *Baseline) KnownHour(actor string, hour int) bool {
 // HasActorHours returns true when there is any timing baseline data.
 func (b *Baseline) HasActorHours() bool {
 	return len(b.ActorHours) > 0
+}
+
+// RelationshipsFor returns the relationship records whose key references the given
+// entity — the scenario keys an "actor:target" pair, so a key whose actor segment
+// (before the first ':') equals the entity, OR any key that contains the entity as
+// a segment, is returned. The result maps the matching relationship KEY → record
+// (empty map, never nil, when there is no relationship data). Case-insensitive.
+// This is the query check-baseline uses to surface actor↔target history (FIX 4).
+func (b *Baseline) RelationshipsFor(entity string) map[string]Relationship {
+	out := map[string]Relationship{}
+	if b == nil || len(b.Relationships) == 0 || entity == "" {
+		return out
+	}
+	el := strings.ToLower(entity)
+	for key, rel := range b.Relationships {
+		// Match the actor segment (before the first ':') exactly, or any ':'-segment.
+		matched := false
+		for _, seg := range strings.Split(key, ":") {
+			if strings.EqualFold(strings.TrimSpace(seg), entity) {
+				matched = true
+				break
+			}
+		}
+		if !matched && strings.Contains(strings.ToLower(key), el) {
+			matched = true
+		}
+		if matched {
+			out[key] = rel
+		}
+	}
+	return out
 }
 
 // IsKnownRole returns true when actor+role is in the actor roles baseline.

@@ -210,18 +210,49 @@ func matchRulesForEvents(root, findingFamily string, findingMetadata map[string]
 
 // eventViews projects typed events into the flat EventView the envelope carries.
 // Always returns a non-nil slice (empty when there are no events).
+//
+// EVAL FIDELITY (FIX 4): target + action are projected out of the event payload so
+// the model sees WHAT each event did and to WHAT — the per-event detail legion's
+// academy fed its agent. Each is an untrusted payload string and is sanitized
+// INDIVIDUALLY via sanitizeEventField on projection.
 func eventViews(events []event.Event) []EventView {
 	out := make([]EventView, 0, len(events))
 	for _, ev := range events {
+		target, action := payloadTargetAction(ev.Payload)
 		out = append(out, EventView{
 			ID:        ev.ID,
 			Source:    ev.Source,
 			Type:      ev.Type,
 			Actor:     ev.Actor,
+			Target:    sanitizeEventField(target),
+			Action:    sanitizeEventField(action),
 			Timestamp: formatTime(ev.Timestamp),
 		})
 	}
 	return out
+}
+
+// payloadTargetAction extracts the "target" and "action" string fields from an
+// event's raw payload JSON, returning ("","") when the payload is empty, not an
+// object, or carries neither field. Non-string values are ignored (the projection
+// only surfaces scalar target/action). This is a pure read; it never errors —
+// a malformed payload simply yields empty target/action (the EventView still
+// carries id/source/type/actor/timestamp).
+func payloadTargetAction(payload json.RawMessage) (target, action string) {
+	if len(payload) == 0 {
+		return "", ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(normalizeRecordKeys(payload), &m); err != nil {
+		return "", ""
+	}
+	if v, ok := m["target"].(string); ok {
+		target = v
+	}
+	if v, ok := m["action"].(string); ok {
+		action = v
+	}
+	return target, action
 }
 
 // formatTime renders a time as RFC3339, or "" when zero.

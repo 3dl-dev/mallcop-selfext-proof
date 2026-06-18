@@ -266,6 +266,95 @@ func TestRunScenario_LiveTools_NotSilentlyEmptyOnReal(t *testing.T) {
 	}
 }
 
+// TestRunScenario_LiveTools_EventTargetActionReachTheModel proves FIX 4 (eval
+// fidelity, event side): a scenario event's target + action now reach the model
+// prompt. Before the fix the eval projected only "actor did <event_type>" and the
+// model was blind to WHAT each event did and to WHAT — the per-event relationship
+// detail legion's academy fed its agent. UT-02's evt_001 carries
+// action=restart_container and a target under atom-api; both must appear in the
+// boxed tool transcript the triage model sees.
+func TestRunScenario_LiveTools_EventTargetActionReachTheModel(t *testing.T) {
+	root := repoRootForTest(t)
+	defer SetRepoRootForTest("")
+	agent.SetRepoRootForTest(root)
+	defer agent.SetRepoRootForTest("")
+
+	ls := loadScenarioForTest(t, root, "behavioral/UT-02-maintenance-window.yaml")
+	be := newRecordingHTTPBackend(t)
+
+	run := RunScenario(context.Background(), be.client(), ls, agent.CascadeOptions{}, true)
+	if run.SeedErr != "" {
+		t.Fatalf("live ToolRunner failed to seed: %s", run.SeedErr)
+	}
+
+	prompt := be.firstUserPrompt(t)
+	// action= and target= must be present, carrying the scenario's per-event detail.
+	if !strings.Contains(prompt, "action=restart_container") {
+		t.Errorf("event ACTION did not reach the model prompt (want action=restart_container)\n--- prompt ---\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "target=") || !strings.Contains(prompt, "atom-api") {
+		t.Errorf("event TARGET did not reach the model prompt (want target=...atom-api)\n--- prompt ---\n%s", prompt)
+	}
+}
+
+// TestRunScenario_LiveTools_RelationshipsReachTheModel proves FIX 4 (eval fidelity,
+// baseline side): the scenario's relationships table is reconstructed into
+// pkg/baseline and surfaced by check-baseline so it reaches the model prompt — the
+// actor↔target history the academy showed its agent. UT-02's baseline records
+// deploy-svc↔atom-api with count 89; the boxed check-baseline transcript must carry
+// a relationships line citing it.
+func TestRunScenario_LiveTools_RelationshipsReachTheModel(t *testing.T) {
+	root := repoRootForTest(t)
+	defer SetRepoRootForTest("")
+	agent.SetRepoRootForTest(root)
+	defer agent.SetRepoRootForTest("")
+
+	ls := loadScenarioForTest(t, root, "behavioral/UT-02-maintenance-window.yaml")
+	be := newRecordingHTTPBackend(t)
+
+	run := RunScenario(context.Background(), be.client(), ls, agent.CascadeOptions{}, true)
+	if run.SeedErr != "" {
+		t.Fatalf("live ToolRunner failed to seed: %s", run.SeedErr)
+	}
+
+	prompt := be.firstUserPrompt(t)
+	if !strings.Contains(prompt, "relationships:") {
+		t.Errorf("the relationships baseline did not reach the model prompt (want a 'relationships:' line)\n--- prompt ---\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "count=89") {
+		t.Errorf("the deploy-svc↔atom-api relationship (count=89) did not reach the model prompt\n--- prompt ---\n%s", prompt)
+	}
+}
+
+// TestBaselineFromScenario_RelationshipsQueryable proves the relationships table is
+// reconstructed into the typed pkg/baseline and is QUERYABLE via RelationshipsFor —
+// the queryable-surface half of FIX 4. UT-02's baseline records two deploy-svc
+// relationships; a lookup on the actor must return them with their counts.
+func TestBaselineFromScenario_RelationshipsQueryable(t *testing.T) {
+	root := repoRootForTest(t)
+	defer SetRepoRootForTest("")
+
+	ls := loadScenarioForTest(t, root, "behavioral/UT-02-maintenance-window.yaml")
+	bl := baselineFromScenario(ls.Scenario)
+	if bl == nil {
+		t.Fatal("baselineFromScenario returned nil for a scenario with a baseline")
+	}
+	rels := bl.RelationshipsFor("deploy-svc")
+	if len(rels) == 0 {
+		t.Fatalf("RelationshipsFor(deploy-svc) returned no relationships; the scenario table was not reconstructed\nrelationships=%v", bl.Relationships)
+	}
+	// The atom-api relationship has count 89 in the corpus.
+	found := false
+	for k, rel := range rels {
+		if strings.Contains(k, "atom-api") && rel.Count == 89 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a deploy-svc↔atom-api relationship with count=89; got %v", rels)
+	}
+}
+
 // TestScenarioToolRunner_ToolEmptyForeignActor proves the ToolEmpty fail-safe
 // signal is real and scenario-scoped: a runner whose search-events filter matches
 // NO event (a finding for an actor absent from the scenario's events) reports

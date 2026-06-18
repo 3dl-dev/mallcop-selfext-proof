@@ -61,6 +61,7 @@ Answer these questions using the data from steps 1-2:
 - Privilege changes → always ESCALATE (non-negotiable)
 - Log format drift → always ESCALATE
 - Resolution requires positive evidence — "actor is known" alone is not enough
+- Prior resolutions don't clear new incidents — each is judged on its own merits
 - Otherwise → ESCALATE
 
 Call resolve-finding. In the reason field, write 2 sentences: what
