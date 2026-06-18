@@ -1,0 +1,19 @@
+# corpus.pin — the SHA-PINNED integrity pin for the eval corpus.
+#
+# The eval (core/eval) verifies the loaded corpus against THIS file before any
+# scenario runs. A count OR sha256 mismatch HARD-FAILS the run (nothing executes)
+# — the eval-as-interlock gate the self-extension loop depends on.
+#
+# WHEN YOU ADD / EDIT / REMOVE A SCENARIO, you MUST regenerate this pin in the
+# same change:
+#   REGEN_PIN=1 MALLCOP_REPO_ROOT=$(git rev-parse --show-toplevel) \
+#     go test ./core/eval/ -run TestRegenPin -v   # (re-add the throwaway helper)
+# or compute it from the loader (core/eval/corpus.go is the source of truth):
+# the digest is sha256 of the canonical manifest — one
+#   "<relpath><two-spaces><sha256(file)>\n" line per included scenario, sorted
+#   by relpath. Leading-underscore paths (_schema.yaml, _test/) are EXCLUDED.
+#
+# count  — number of scenarios the walker includes (underscore paths skipped).
+# sha256 — sha256 of the canonical manifest.
+count 56
+sha256 8502c04fd94b1775e43f5e19481a55409d6ba0fc8b35339c46eba5a7a431a80f
