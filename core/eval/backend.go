@@ -31,6 +31,7 @@
 package eval
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -52,25 +53,44 @@ const (
 	ModeReal Mode = "real"
 )
 
-// goldenScript returns the cannedbackend CannedResolutionFunc that makes ONE
-// scenario reach its EXPECTED terminal action. The runner drives one scenario per
-// backend, so the script is keyed purely on call index within that scenario.
+// goldenScript returns the cannedbackend CannedContentFunc that makes ONE scenario
+// reach its EXPECTED terminal action. It is CONTENT-AWARE: it routes each response
+// by the TIER / DIRECTED HYPOTHESIS identifiable in the request's system prompt —
+// NOT by a global call index — exactly like the scriptedPanelBackend in
+// core/agent/fanout_test.go.
 //
-// The contract mirrors the cascade (cascade.go / tier.go):
+// WHY CONTENT-AWARE (the residual Rule-11 flake this kills). A scenario whose
+// triage escalates and whose investigate proposes a resolve gets that resolve
+// BLOCKED by the structural-confidence gate (the merge-gate runs tool-free, so the
+// structural score is well below 0.55), which fans out to THREE deep-investigate
+// tiers that run CONCURRENTLY. A script keyed on a global call index cannot return
+// the right per-hypothesis verdict to each of the 3 concurrent deep calls — the
+// index→response mapping is order-nondeterministic, which scrambles the golden
+// responses and intermittently flips the gate's pinned exact pass rate (~10%/run).
+// Routing on the system prompt's tier/hypothesis marker makes each of the 3
+// concurrent deep calls deterministically get ITS hypothesis's golden response
+// regardless of goroutine scheduling.
 //
-//	expected resolved → call 0 (triage) returns a CLEAN resolve:
-//	    action=resolve, confidence=5, positive_evidence=true → cleanResolve()==true
-//	    → terminal RESOLVED at triage (1 call).
+// The contract mirrors the cascade (cascade.go / tier.go / fanout.go):
 //
-//	expected escalated → call 0 (triage) escalate, call 1 (investigate) escalate,
-//	    call 2 (escalate-formatter) free-text alert → terminal ESCALATED (3 calls).
-//	    The alert text embeds the scenario's reasoning_must_mention substrings so
-//	    the (non-gating) Mentions axis also passes under golden responses.
+//	expected resolved → triage returns a CLEAN resolve (action=resolve,
+//	    confidence=5, positive_evidence=true → cleanResolve()==true) → terminal
+//	    RESOLVED at triage (1 call). If such a scenario nonetheless reaches the
+//	    fan-out, all 3 deep hypotheses also return a well-evidenced resolve so the
+//	    panel resolves (benign) deterministically.
 //
-// A force-escalated scenario (priv-escalation / injection-probe / log-format-drift)
-// makes ZERO model calls — the floor escalates pre-model — so the script is never
-// invoked for it; the merge-gate still passes on chain_action via the floor.
-func goldenScript(s *exam.Scenario) func(callIndex int) string {
+//	expected escalated → triage escalate, investigate escalate, escalate-formatter
+//	    free-text alert → terminal ESCALATED (3 calls). The alert text embeds the
+//	    scenario's reasoning_must_mention substrings so the (non-gating) Mentions
+//	    axis also passes. If an escalated scenario instead routes triage-escalate →
+//	    investigate-RESOLVE-blocked → fan-out, the deep tiers escalate (malicious
+//	    with a strong indicator) so the panel escalates deterministically.
+//
+// A force-escalated scenario (priv-escalation / injection-probe / log-format-drift,
+// E-007 / E-008) makes ZERO model calls — the floor escalates pre-model — so the
+// script is never invoked for it; the merge-gate still passes on chain_action via
+// the floor.
+func goldenScript(s *exam.Scenario) func(body []byte) string {
 	expectResolved := false
 	var mentions []string
 	if exp := s.ExpectedResolution; exp != nil {
@@ -78,38 +98,132 @@ func goldenScript(s *exam.Scenario) func(callIndex int) string {
 		mentions = exp.ReasoningMustMention
 	}
 
-	if expectResolved {
-		// One clean triage resolve closes the finding benign. Embed the
-		// must-mention substrings in the reason so the Mentions axis passes too
-		// (the resolve terminal reason is "triage resolved (benign): "+reason).
-		reason := "benign: positive evidence of legitimacy in events + baseline. " + mentionTail(mentions)
-		resolve := fmt.Sprintf(
-			`{"action":"resolve","confidence":5,"positive_evidence":true,"strong_evidence":false,"insufficient_data":false,"reason":%q}`,
-			reason)
-		return func(callIndex int) string {
-			// Only call 0 is expected; any extra call still resolves (defensive).
-			return resolve
-		}
-	}
+	// Golden response payloads, keyed by tier/hypothesis.
+	//
+	// RESOLVE side: a clean, positively-evidenced benign resolve. Used for the
+	// triage tier of an expected-resolved scenario AND for all 3 deep hypotheses
+	// of an expected-resolved scenario that fans out (so the panel resolves: 3
+	// agree benign, each with positive evidence).
+	resolveReason := "benign: positive evidence of legitimacy in events + baseline. " + mentionTail(mentions)
+	cleanResolve := fmt.Sprintf(
+		`{"action":"resolve","confidence":5,"positive_evidence":true,"strong_evidence":false,"insufficient_data":false,"reason":%q}`,
+		resolveReason)
 
-	// Escalate path: triage → investigate → escalate-formatter.
+	// ESCALATE side: triage + investigate escalates, and per-hypothesis deep
+	// escalates (malicious carries the strong indicator so a fanned-out escalate
+	// scenario escalates via the strong-malicious aggregation rule, not a count).
 	escTriage := `{"action":"escalate","confidence":3,"positive_evidence":false,"strong_evidence":false,"insufficient_data":false,"reason":"triage: no positive evidence to clear; escalating for investigation."}`
 	escInvestigate := `{"action":"escalate","confidence":4,"positive_evidence":false,"strong_evidence":true,"insufficient_data":false,"reason":"investigate: confirmed suspicious pattern; escalating to a human."}`
+	deepBenignEsc := `{"action":"escalate","confidence":2,"positive_evidence":false,"strong_evidence":false,"insufficient_data":false,"reason":"deep(benign): could not confirm benign; no positive evidence of legitimacy."}`
+	deepMaliciousEsc := `{"action":"escalate","confidence":5,"positive_evidence":false,"strong_evidence":true,"insufficient_data":false,"reason":"deep(malicious): DECISIVE attack vector found; escalating."}`
+	deepIncompleteEsc := `{"action":"escalate","confidence":3,"positive_evidence":false,"strong_evidence":false,"insufficient_data":true,"reason":"deep(incomplete): the disambiguating data is missing; cannot determine."}`
 	// The escalate formatter returns free-text (no JSON verdict). Embed the
 	// must-mention substrings here — this IS the terminal reason for an escalated
 	// finding (cascade.escalate uses the formatter's text as the alert).
 	alert := "SECURITY ALERT: suspicious activity requires human review. " + mentionTail(mentions)
 
-	return func(callIndex int) string {
-		switch callIndex {
-		case 0:
+	return func(body []byte) string {
+		tier, hypothesis := routeFromBody(body)
+		switch tier {
+		case tierTriage:
+			if expectResolved {
+				return cleanResolve
+			}
 			return escTriage
-		case 1:
+		case tierInvestigate:
+			// Reached only on the escalate path (a resolved scenario terminates at
+			// triage). Investigate escalates → terminal escalate via the formatter.
 			return escInvestigate
+		case tierDeep:
+			// Fan-out: each of the 3 concurrent deep calls is routed by ITS
+			// directed hypothesis, so the verdict is deterministic regardless of
+			// goroutine completion order.
+			if expectResolved {
+				return cleanResolve // 3 agree benign (positive evidence) → panel resolves
+			}
+			switch hypothesis {
+			case hypMalicious:
+				return deepMaliciousEsc
+			case hypIncomplete:
+				return deepIncompleteEsc
+			default: // benign
+				return deepBenignEsc
+			}
+		case tierEscalate:
+			return alert
 		default:
-			// call 2 (escalate formatter) and any deep-panel calls.
+			// Unrecognized tier: fail to the scenario's expected side so the gate
+			// stays meaningful rather than silently mis-scoring.
+			if expectResolved {
+				return cleanResolve
+			}
 			return alert
 		}
+	}
+}
+
+// goldenTier / goldenHypothesis are the content-routing keys derived from a
+// request's system prompt.
+type goldenTier int
+
+const (
+	tierUnknown goldenTier = iota
+	tierTriage
+	tierInvestigate
+	tierDeep
+	tierEscalate
+)
+
+type goldenHypothesis int
+
+const (
+	hypNone goldenHypothesis = iota
+	hypBenign
+	hypMalicious
+	hypIncomplete
+)
+
+// goldenRequest is the minimal shape we decode from the Anthropic-wire request
+// body to read the system prompt. The cannedbackend hands goldenScript the raw
+// body; we only need the "system" field to route by tier/hypothesis.
+type goldenRequest struct {
+	System string `json:"system"`
+}
+
+// routeFromBody decodes the request body's system prompt and classifies it into a
+// tier (+ hypothesis for the deep tier). The markers are the literal section
+// headers / directed-prior text baked into core/agent/prompts.go — the same
+// markers core/agent/fanout_test.go's content-aware backend routes on. The deep
+// check comes FIRST because a deep prompt embeds the full investigate prompt
+// (deepInvestigateSystemPrompt = preamble + prior + investigateSystemPrompt), so
+// it also contains "# Investigation Agent"; the "# Deep Investigation Agent"
+// preamble disambiguates it.
+func routeFromBody(body []byte) (goldenTier, goldenHypothesis) {
+	var req goldenRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return tierUnknown, hypNone
+	}
+	sys := req.System
+	switch {
+	case strings.Contains(sys, "# Deep Investigation Agent"):
+		switch {
+		case strings.Contains(sys, "BENIGN: Assume the activity is legitimate"):
+			return tierDeep, hypBenign
+		case strings.Contains(sys, "MALICIOUS: Assume the credentials are compromised"):
+			return tierDeep, hypMalicious
+		case strings.Contains(sys, "INCOMPLETE: Assume the parent could not resolve"):
+			return tierDeep, hypIncomplete
+		default:
+			return tierDeep, hypNone
+		}
+	case strings.Contains(sys, "# Investigation Agent"):
+		return tierInvestigate, hypNone
+	case strings.Contains(sys, "# Triage Agent"):
+		return tierTriage, hypNone
+	case strings.Contains(sys, "# Escalate Agent"):
+		return tierEscalate, hypNone
+	default:
+		return tierUnknown, hypNone
 	}
 }
 
@@ -127,7 +241,10 @@ func mentionTail(mentions []string) string {
 // responses and returns an agent.Client (a DirectClient pointed at it) plus a
 // stop func. The caller MUST call stop when the scenario is done.
 func newCannedClient(s *exam.Scenario) (agent.Client, func(), error) {
-	be := &cannedbackend.CannedBackend{CannedResolutionFunc: goldenScript(s)}
+	// CannedContentFunc (content-aware) — NOT CannedResolutionFunc (call-index) —
+	// so the golden responses are deterministic under the fan-out's 3 concurrent
+	// deep calls. See goldenScript.
+	be := &cannedbackend.CannedBackend{CannedContentFunc: goldenScript(s)}
 	if err := be.Start(); err != nil {
 		return nil, func() {}, fmt.Errorf("start canned backend: %w", err)
 	}

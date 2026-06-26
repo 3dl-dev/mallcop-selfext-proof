@@ -34,7 +34,25 @@ type CannedBackend struct {
 	// CannedResolutionFunc, if non-nil, is called with the 0-indexed call
 	// number and should return the assistant content string for that call.
 	// Defaults to DefaultCannedResolutionForCall when nil.
+	//
+	// CALL-INDEX SCRIPTING IS ORDER-DEPENDENT. It is correct only when calls
+	// arrive SERIALLY (budget / pipeline / e2e tests). The cascade's fan-out
+	// issues THREE deep-investigate calls CONCURRENTLY, so the call index a given
+	// deep call observes is nondeterministic — a script keyed on the index cannot
+	// return the right per-hypothesis verdict under concurrency. For that, set
+	// CannedContentFunc (below), which routes by request CONTENT instead.
 	CannedResolutionFunc func(callIndex int) string
+
+	// CannedContentFunc, if non-nil, takes PRECEDENCE over CannedResolutionFunc:
+	// it receives the raw request body (which carries the Anthropic-wire "system"
+	// prompt and the boxed user message) and returns the assistant content for
+	// that call. Because it routes on the request's CONTENT — the tier / directed
+	// hypothesis identifiable in the system prompt — rather than a global call
+	// index, it is DETERMINISTIC under the fan-out's concurrent deep calls: each
+	// of the 3 deep goroutines deterministically gets its hypothesis's golden
+	// response regardless of goroutine scheduling. This mirrors the content-aware
+	// scriptedPanelBackend in core/agent/fanout_test.go.
+	CannedContentFunc func(body []byte) string
 
 	server   *http.Server
 	listener net.Listener
@@ -138,15 +156,19 @@ func (b *CannedBackend) handleChatCompletions(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	b.record(r.URL.Path, body)
+	// record() assigns this call its 0-based index atomically and returns it — the
+	// index is NOT re-read from a separate atomic load (that two-step
+	// increment-then-load was a logical race under concurrent calls: two
+	// goroutines could observe the same call count). step is 1-indexed for the
+	// response id; callIndex is 0-based for the script.
+	callIndex := b.record(r.URL.Path, body)
+	step := callIndex + 1
 
 	// Split tokens roughly 80/20 input/output.
 	inputTokens := int(float64(b.TokensPerResponse) * 0.8)
 	outputTokens := b.TokensPerResponse - inputTokens
 
-	step := b.CallCount() // 1-indexed after record() incremented callCount
-	callIndex := step - 1
-	cannedContent := b.CannedResolutionFunc(callIndex)
+	cannedContent := b.content(callIndex, body)
 
 	resp := map[string]interface{}{
 		"id":     fmt.Sprintf("chatcmpl-canned-%04d", step),
@@ -188,14 +210,15 @@ func (b *CannedBackend) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b.record(r.URL.Path, body)
+	// See handleChatCompletions: record() returns the call's 0-based index in one
+	// atomic step (no separate load — that was the concurrency race).
+	callIndex := b.record(r.URL.Path, body)
+	step := callIndex + 1
 
 	inputTokens := int(float64(b.TokensPerResponse) * 0.8)
 	outputTokens := b.TokensPerResponse - inputTokens
 
-	step := b.CallCount()
-	callIndex := step - 1
-	cannedContent := b.CannedResolutionFunc(callIndex)
+	cannedContent := b.content(callIndex, body)
 
 	resp := map[string]interface{}{
 		"id":   fmt.Sprintf("msg-canned-%04d", step),
@@ -218,11 +241,28 @@ func (b *CannedBackend) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (b *CannedBackend) record(path string, body []byte) {
-	b.callCount.Add(1)
+// record appends the request and returns this call's 0-based index. The index is
+// taken from the SAME atomic increment that bumps callCount (Add returns the new
+// value), so concurrent callers each get a distinct index with no separate load —
+// this is what kills the increment-then-load logical race the fan-out's 3
+// concurrent deep calls used to hit.
+func (b *CannedBackend) record(path string, body []byte) int {
+	idx := int(b.callCount.Add(1)) - 1
 	b.mu.Lock()
 	b.requests = append(b.requests, CannedRequest{Path: path, Body: body})
 	b.mu.Unlock()
+	return idx
+}
+
+// content resolves the assistant content for a call. CannedContentFunc (content-
+// aware, routes on the request body's system prompt) takes precedence; it is the
+// concurrency-safe path the fan-out needs. Otherwise the legacy call-index script
+// (CannedResolutionFunc) is used — correct for serial callers only.
+func (b *CannedBackend) content(callIndex int, body []byte) string {
+	if b.CannedContentFunc != nil {
+		return b.CannedContentFunc(body)
+	}
+	return b.CannedResolutionFunc(callIndex)
 }
 
 // ---------------------------------------------------------------------------
