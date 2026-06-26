@@ -35,8 +35,8 @@
 package eval
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -58,10 +58,31 @@ import (
 // store seeded with the scenario's events + finding and a baseline reconstructed
 // from the scenario's baseline block, and dispatches RunTools to the REAL
 // core/tools over that data. It implements agent.ToolRunner.
+//
+// CONCURRENCY (the recurring -race flake class, fix #3). The cascade's deep-panel
+// fan-out (core/agent/fanout.go) issues THREE RunTools calls CONCURRENTLY against
+// the SAME runner. The earlier design re-ran every tool on every call — each call
+// re-shelled `git rev-parse HEAD` + `git cat-file` over the per-scenario store and
+// re-walked the operator-decisions corpus (os.Executable walk + file read). That
+// is shared MUTABLE EXTERNAL state (one git repo, the process temp dir, the binary
+// walk) read concurrently: it produces NO Go data race (every call has its own Go
+// locals) yet can DIVERGE — a concurrent call can observe a transiently empty /
+// partial git read and compute the role-grant / zero-history predicate on
+// INCOMPLETE events, flipping a terminal escalate to a resolve ~2% of the time.
+// This is the same class as the repoRoot-global and backend-content-routing flakes
+// already closed in this harness.
+//
+// THE FIX (systemic, not a symptom patch): all per-scenario telemetry is read from
+// the store EXACTLY ONCE, up front, into an IMMUTABLE snapshot (events, matched
+// rules, findings, and the two observable predicates). RunTools never touches the
+// git store, the corpus walk, or any shared map after construction — it only reads
+// frozen fields and writes to its own local strings.Builders. The predicates are
+// computed once and returned identically on every call, so the role-grant /
+// zero-history forces compute the SAME regardless of goroutine scheduling. Nothing
+// the runner reads during RunTools is mutated after newScenarioToolRunner returns,
+// so concurrent RunTools calls are trivially safe.
 type scenarioToolRunner struct {
-	store    *store.Store
 	baseline *baseline.Baseline
-	repoRoot string // for the §3.8 operator-decisions rule corpus (matched_rules)
 
 	// family + meta drive the §3.8 rule fold and the check-baseline lookup. meta
 	// is the OBSERVABLE predicate: the finding metadata UNIONED with the metadata
@@ -76,6 +97,45 @@ type scenarioToolRunner struct {
 	actor  string
 	source string
 	meta   map[string]string
+
+	// snap is the IMMUTABLE per-scenario evidence snapshot, computed ONCE in
+	// newScenarioToolRunner. RunTools reads ONLY these frozen fields (plus the
+	// immutable baseline/meta above) — never the git store — so concurrent calls
+	// from the deep-panel fan-out cannot observe a partial read. Treat every field
+	// as read-only after construction.
+	snap scenarioSnapshot
+}
+
+// scenarioSnapshot is the frozen evidence one scenario yields. Every field is
+// computed once (over a single, committed git read) and then read-only: RunTools
+// renders subsets of it per tier but never mutates it and never re-reads the
+// store. The slices are never appended to after construction; the predicate
+// booleans + details are the §4.3 observable forces computed from the SAME
+// surfaced events the model sees, so they are byte-stable across calls.
+type scenarioSnapshot struct {
+	// events is the surfaced event set the model and the predicates BOTH read:
+	// the actor/source-filtered read, with the new-actor fallback already folded
+	// in (FIX 2). Computed once so all three deep goroutines render identical
+	// events.
+	events []tools.EventView
+	// matchedRules is the §3.8 operator-decisions fold (corpus walk OR the
+	// explicit-repoRoot LookupRules fallback), resolved once.
+	matchedRules []tools.OperatorRule
+	// findings is the seeded findings stream (investigate tier only).
+	findings []finding.Finding
+	// searchEmpty mirrors the old ToolEmpty: the relied-on search-events surfaced
+	// no events. An empty read is data, not a dismissal (§3.4 / §2.5).
+	searchEmpty bool
+
+	// The two observable force-escalate predicates (§4.3), computed ONCE over the
+	// frozen events + the typed baseline. roleGrant terminal-escalates a privilege
+	// grant by the finding actor with no precedent; zeroHist hands a zero-history
+	// access to investigate. Frozen here so every RunTools call returns the same
+	// force regardless of which goroutine runs it.
+	zeroHist   bool
+	zeroDetail string
+	roleGrant  bool
+	roleDetail string
 }
 
 // newScenarioToolRunner builds a live ToolRunner over one scenario's telemetry.
@@ -94,15 +154,81 @@ func newScenarioToolRunner(tmpDir, repoRoot string, s *exam.Scenario) (*scenario
 	if err != nil {
 		return nil, err
 	}
-	return &scenarioToolRunner{
-		store:    st,
+	r := &scenarioToolRunner{
 		baseline: baselineFromScenario(s),
-		repoRoot: repoRoot,
 		family:   scenarioFamily(s),
 		actor:    scenarioActor(s),
 		source:   scenarioSource(s),
 		meta:     scenarioObservableMeta(s),
-	}, nil
+	}
+	// Read the per-scenario telemetry from the store EXACTLY ONCE into an
+	// immutable snapshot. After this returns, RunTools never touches the store —
+	// it reads only frozen fields — so the deep-panel fan-out's concurrent RunTools
+	// calls cannot race on a partial git read (the recurring -race flake class).
+	snap, err := r.seedSnapshot(st, repoRoot, finding.Finding{})
+	if err != nil {
+		return nil, err
+	}
+	r.snap = snap
+	return r, nil
+}
+
+// seedSnapshot performs the SINGLE store read + rule fold + predicate computation
+// that backs every RunTools call. It is invoked once from newScenarioToolRunner
+// (the only place that holds the *store.Store) and its result is frozen into
+// r.snap. It mutates no shared state; it reads the seeded store and the
+// operator-decisions corpus and returns an immutable snapshot.
+//
+// f carries only the finding id/family for the §3.8 LookupRules fallback; the
+// surfaced events, the actor/source filter, and the two predicates are identical
+// for every tier, so they are computed once here and rendered per-tier later.
+func (r *scenarioToolRunner) seedSnapshot(st *store.Store, repoRoot string, f finding.Finding) (scenarioSnapshot, error) {
+	var snap scenarioSnapshot
+
+	// --- search-events: the one read the predicates + the model both consume. ---
+	// Filter by the finding's actor + source so the snapshot scopes to the entity
+	// under investigation (production scopes the read the same way; an empty
+	// actor/source yields the full stream, the unfiltered read).
+	in := tools.SearchEventsInput{Actor: r.actor, Source: r.source}
+	env, err := tools.SearchEventsWrapped(st, in, r.family, r.meta)
+	if err != nil {
+		// A genuine schema violation (unreadable store, malformed record). The
+		// cascade treats a tool ERROR as a fail-safe escalate, so surface it.
+		return scenarioSnapshot{}, fmt.Errorf("search-events: %w", err)
+	}
+	// FIX 2 (EVAL FIDELITY): when the actor-filter returns NO events for a finding
+	// about a NEW actor, the creation events are authored by a DIFFERENT principal
+	// (ID-01). Surface events whose target / principal_id / display_name names the
+	// finding actor so triage can resolve ID-01 as designed. This only ADDS
+	// resolving evidence when the direct read was empty; it never suppresses events.
+	if len(env.Events) == 0 && r.actor != "" {
+		if alt := r.eventsNamingActor(st); len(alt) > 0 {
+			env.Events = alt
+		}
+	}
+	// §3.8 matched_rules fold. SearchEventsWrapped resolves the corpus via the
+	// binary-walk (the PRODUCTION path); under the eval harness that walk can miss
+	// the corpus, so fall back to the explicit-repoRoot LookupRules. Either way the
+	// model sees the SAME matched_rules production folds in, reproducibly (§4.1).
+	if len(env.MatchedRules) == 0 && repoRoot != "" && r.family != "" {
+		if out, lErr := tools.LookupRules(repoRoot, lookupInput(f, r.family, r.meta)); lErr == nil {
+			env.MatchedRules = out.Rules
+		}
+	}
+	snap.events = env.Events
+	snap.matchedRules = env.MatchedRules
+	snap.searchEmpty = len(env.Events) == 0
+
+	// --- the two observable forces, computed ONCE over the frozen events. -------
+	snap.zeroHist, snap.zeroDetail = r.zeroHistoryAccess(snap.events)
+	snap.roleGrant, snap.roleDetail = r.roleGrantByActor(snap.events)
+
+	// --- search-findings (investigate tier renders this; read once). ------------
+	if fs, fErr := tools.SearchFindings(st, tools.SearchFindingsInput{Actor: r.actor}); fErr == nil {
+		snap.findings = fs
+	}
+
+	return snap, nil
 }
 
 // RunTools gathers evidence for one tier over THIS scenario's telemetry and
@@ -115,6 +241,16 @@ func newScenarioToolRunner(tmpDir, repoRoot string, s *exam.Scenario) (*scenario
 // read is data, not a dismissal — the fail-safe force-escalates a resolve built
 // on it (§3.4 / §2.5).
 func (r *scenarioToolRunner) RunTools(ctx context.Context, tier string, f finding.Finding) (agent.ToolEvidence, error) {
+	// CONCURRENCY-SAFE BY CONSTRUCTION. RunTools reads ONLY the immutable snapshot
+	// (r.snap, frozen in newScenarioToolRunner) and the immutable baseline/meta,
+	// and writes ONLY to its own local strings.Builders. It does NOT touch the git
+	// store, the corpus walk, or any shared map — so the deep-panel fan-out's three
+	// concurrent RunTools calls render IDENTICAL evidence and IDENTICAL predicates
+	// regardless of goroutine scheduling. The earlier design re-read the store on
+	// every call; a concurrent partial git read could flip the role-grant /
+	// zero-history force (the recurring -race flake). The single up-front read kills
+	// that class.
+	//
 	// FIX 1: build ONE text section PER TOOL (baseline / events / findings) so the
 	// cascade boxes each as its OWN WrapUntrusted field, each independently 1024-
 	// capped — the high-signal check-baseline + relationship evidence (VA-03's
@@ -123,68 +259,21 @@ func (r *scenarioToolRunner) RunTools(ctx context.Context, tier string, f findin
 	var eventsB, baselineB, findingsB strings.Builder
 	calls := 0
 	distinct := 0
-	searchEmpty := false
 
-	// --- search-events (every tier) — folds §3.8 matched_rules. ---------------
-	// Filter by the finding's actor + source so the model sees the events for the
-	// entity under investigation (production scopes the read the same way; an
-	// empty actor/source yields the full stream, which is the unfiltered read).
-	in := tools.SearchEventsInput{Actor: r.actor, Source: r.source}
-	env, err := tools.SearchEventsWrapped(r.store, in, r.family, r.meta)
-	if err != nil {
-		// A genuine schema violation (unreadable store, malformed record) — the
-		// cascade treats a tool ERROR as a fail-safe escalate. Surface it.
-		return agent.ToolEvidence{}, fmt.Errorf("search-events: %w", err)
-	}
-	// FIX 2 (EVAL FIDELITY): when the actor-filter returns NO events for a finding
-	// about a NEW actor, the creation events are authored by a DIFFERENT principal
-	// (ID-01: deploy-svc-new's creation events are authored by admin-user, with the
-	// finding actor appearing as the event TARGET / principal_id / display_name).
-	// An empty read would make ToolEmpty true and force a fail-safe escalate — but
-	// ID-01 is a benign onboarding the chain must RESOLVE. So when the actor-filter
-	// is empty, ALSO surface events whose target / principal_id / display_name names
-	// the finding actor, so triage can resolve ID-01 as designed.
-	// GUARD: this only ADDS resolving evidence when the direct read was empty; it
-	// never suppresses events. ID-03 / ID-04 (malicious/ambiguous new actors)
-	// perform their OWN events (the finding actor IS the event actor), so the direct
-	// read is non-empty and this fallback does not fire for them — they still escalate.
-	if len(env.Events) == 0 && r.actor != "" {
-		if alt := r.eventsNamingActor(); len(alt) > 0 {
-			env.Events = alt
-		}
-	}
-	// §3.8 matched_rules fold. SearchEventsWrapped resolves the operator-decisions
-	// corpus via the binary-walk (findConfigRoot) — the PRODUCTION path. Under the
-	// eval harness the "binary" is the test/harness binary, so the walk can miss
-	// the corpus; we then fold the rules DETERMINISTICALLY through the real
-	// tools.LookupRules, which takes our explicit repoRoot. Either way the model
-	// sees the SAME matched_rules production folds in (§3.8), reproducibly (§4.1).
-	if len(env.MatchedRules) == 0 && r.repoRoot != "" && r.family != "" {
-		if out, lErr := tools.LookupRules(r.repoRoot, lookupInput(f, r.family, r.meta)); lErr == nil {
-			env.MatchedRules = out.Rules
-		}
-	}
-	calls++
-	distinct++
+	// --- search-events (every tier) — rendered from the frozen snapshot. ------
 	// COMPACT rendering, not the full JSON envelope: each per-tool field is still
 	// 1024-capped by the cascade's per-field sanitizer (sanitize.go) — the SAME cap
 	// the production model sees. We render the high-signal facts (event ids, matched
 	// rule ids+family, per-event discriminating metadata) so the salient evidence
-	// survives the cap.
-	writeSearchEvents(&eventsB, env)
-	if len(env.Events) == 0 {
-		searchEmpty = true
-	}
-
-	// FIX 3 (OBSERVABLE FORCE-ESCALATE, event-keyed): compute the two structural
-	// predicates the triage gate forces a clean resolve to escalate on — from the
-	// REAL surfaced events + the typed baseline, never from the model. Keyed on the
-	// EVENT predicate (zero relationship-history with an accessed target; a role-grant
-	// the finding actor has no precedent for), never on detector family.
-	zeroHist, zeroDetail := r.zeroHistoryAccess(env.Events)
-	roleGrant, roleDetail := r.roleGrantByActor(env.Events)
+	// survives the cap. The envelope is reconstructed from the snapshot's frozen
+	// events + matched rules so writeSearchEvents renders exactly as before.
+	calls++
+	distinct++
+	writeSearchEvents(&eventsB, SearchEventsEnvelopeFromSnapshot(r.snap.events, r.snap.matchedRules))
 
 	// --- check-baseline (every tier) — "is this routine for this actor". ------
+	// CheckBaseline is a PURE function over the immutable baseline (no store I/O,
+	// no shared mutation), so it stays inline; its result is deterministic.
 	if r.actor != "" {
 		bl, err := tools.CheckBaseline(r.baseline, tools.CheckBaselineInput{
 			Entity:    r.actor,
@@ -201,29 +290,29 @@ func (r *scenarioToolRunner) RunTools(ctx context.Context, tier string, f findin
 		// rather than fail the whole evidence gather — search-events still ran.
 	}
 
-	// --- search-findings (investigate tier only) — the deeper sweep. ----------
+	// --- search-findings (investigate tier only) — rendered from the snapshot. -
 	if strings.EqualFold(tier, "investigate") {
-		fs, err := tools.SearchFindings(r.store, tools.SearchFindingsInput{Actor: r.actor})
-		if err == nil {
-			calls++
-			distinct++
-			writeSearchFindings(&findingsB, fs)
-		}
+		calls++
+		distinct++
+		writeSearchFindings(&findingsB, r.snap.findings)
 	}
 
 	return agent.ToolEvidence{
 		// FIX 1: per-tool boxed fields. Text is left empty so the cascade boxes the
 		// per-tool fields individually (each independently 1024-capped).
-		BaselineText:      baselineB.String(),
-		EventsText:        eventsB.String(),
-		FindingsText:      findingsB.String(),
-		ToolCalls:         calls,
-		DistinctTools:     distinct,
-		ToolEmpty:         searchEmpty,
-		ZeroHistoryAccess: zeroHist,
-		ZeroHistoryDetail: zeroDetail,
-		RoleGrantByActor:  roleGrant,
-		RoleGrantDetail:   roleDetail,
+		BaselineText:  baselineB.String(),
+		EventsText:    eventsB.String(),
+		FindingsText:  findingsB.String(),
+		ToolCalls:     calls,
+		DistinctTools: distinct,
+		ToolEmpty:     r.snap.searchEmpty,
+		// FIX 3 (OBSERVABLE FORCE-ESCALATE, event-keyed): the two structural
+		// predicates, computed ONCE in seedSnapshot over the REAL surfaced events +
+		// the typed baseline (never the model). Returned identically on every call.
+		ZeroHistoryAccess: r.snap.zeroHist,
+		ZeroHistoryDetail: r.snap.zeroDetail,
+		RoleGrantByActor:  r.snap.roleGrant,
+		RoleGrantDetail:   r.snap.roleDetail,
 	}, nil
 }
 
@@ -231,10 +320,10 @@ func (r *scenarioToolRunner) RunTools(ctx context.Context, tier string, f findin
 // signatures the FIX 3 (b) predicate keys on. A surfaced event whose type or action
 // is one of these is a role grant. Compared after separator-stripping + lower-case.
 var roleGrantEventTypes = map[string]struct{}{
-	"roleassignment":   {},
-	"roleassign":       {},
-	"permissiongrant":  {},
-	"privilegegrant":   {},
+	"roleassignment":  {},
+	"roleassign":      {},
+	"permissiongrant": {},
+	"privilegegrant":  {},
 }
 
 var roleGrantActions = map[string]struct{}{
@@ -251,11 +340,14 @@ var roleGrantActions = map[string]struct{}{
 // because the new actor authored no events yet, but it appears as the object of
 // its own creation. Returns the matching EventView set (empty when none match), so
 // triage sees the benign creation context (ID-01) instead of an empty read.
-func (r *scenarioToolRunner) eventsNamingActor() []tools.EventView {
+// eventsNamingActor is called ONCE from seedSnapshot (which holds the store)
+// while building the immutable snapshot — never from the concurrent RunTools path
+// — so it takes the store explicitly rather than from a runner field.
+func (r *scenarioToolRunner) eventsNamingActor(st *store.Store) []tools.EventView {
 	if r.actor == "" {
 		return nil
 	}
-	full, _, err := tools.SearchEvents(r.store, tools.SearchEventsInput{})
+	full, _, err := tools.SearchEvents(st, tools.SearchEventsInput{})
 	if err != nil {
 		return nil
 	}
@@ -597,6 +689,20 @@ var eventMetaRenderOrder = []string{
 	"ip",
 	"location",
 	"user_agent",
+}
+
+// SearchEventsEnvelopeFromSnapshot reconstructs the minimal SearchEventsEnvelope
+// writeSearchEvents renders — its Events and MatchedRules — from the frozen
+// snapshot slices. It exists so RunTools renders the SAME compact transcript it
+// always did while reading ONLY immutable snapshot data (no store re-read). Only
+// the two fields writeSearchEvents consumes are populated; the rest of the
+// envelope (FilterApplied, Notes) is not rendered by writeSearchEvents and is left
+// at its zero value deliberately. The input slices are treated as read-only.
+func SearchEventsEnvelopeFromSnapshot(events []tools.EventView, rules []tools.OperatorRule) tools.SearchEventsEnvelope {
+	return tools.SearchEventsEnvelope{
+		Events:       events,
+		MatchedRules: rules,
+	}
 }
 
 // writeSearchEvents renders the search-events result COMPACTLY: one line listing

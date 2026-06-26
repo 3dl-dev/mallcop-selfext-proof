@@ -371,12 +371,23 @@ func TestScenarioToolRunner_ToolEmptyForeignActor(t *testing.T) {
 	defer agent.SetRepoRootForTest("")
 
 	ls := loadScenarioForTest(t, root, "behavioral/UT-02-maintenance-window.yaml")
+	// Force the search filter to an actor that owns no events in this scenario.
+	// The runner snapshots the actor-scoped read ONCE at construction (the §4.3
+	// concurrency fix), so the foreign actor must be set on the scenario BEFORE the
+	// runner is built — pointing the search filter at an actor absent from the
+	// events is exactly what makes search-events surface nothing (ToolEmpty=true).
+	if ls.Scenario.Finding == nil {
+		t.Fatalf("UT-02 has no finding block; cannot pin the foreign actor")
+	}
+	if ls.Scenario.Finding.Metadata == nil {
+		ls.Scenario.Finding.Metadata = exam.FindingMetadata{}
+	}
+	ls.Scenario.Finding.Metadata["actor"] = "actor-not-in-this-scenario"
+
 	r, err := newScenarioToolRunner(t.TempDir(), root, ls.Scenario)
 	if err != nil {
 		t.Fatalf("new runner: %v", err)
 	}
-	// Force the search filter to an actor that owns no events in this scenario.
-	r.actor = "actor-not-in-this-scenario"
 
 	ev, err := r.RunTools(context.Background(), "triage", findingFromScenario(ls.Scenario))
 	if err != nil {
