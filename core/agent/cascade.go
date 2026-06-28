@@ -240,6 +240,26 @@ type ToolEvidence struct {
 	// RoleGrantDetail names the role-grant event for the audit trail. Empty when
 	// RoleGrantByActor is false.
 	RoleGrantDetail string
+
+	// FIX 4 (OBSERVABLE FORCE-ESCALATE, action-keyed): BulkExportNoJustification is
+	// true when the surfaced events show the FINDING ACTOR performing a HIGH-VOLUME
+	// read / PII / secret export (operation_count above the floor, rows_affected
+	// above the floor, export_format present, includes_pii=true, or a bulk/dump/
+	// export action) with NO legitimate-justification companion event (no job_id /
+	// ticket_id / schedule / scheduled / maintenance_window / window_id in ANY of the
+	// finding's events). This is the discriminator the relationship-based predicates
+	// CANNOT see: URA-03 (admin's first-ever 15,000-row pg_dump) and URA-04 (benign
+	// sibling maintenance) share the SAME group-level relationship — the DISCRIMINATOR
+	// IS THE ACTION. It TERMINAL-escalates (model-independent): an unjustified bulk
+	// export is a data-exfiltration indicator regardless of how established the actor
+	// is. It does NOT fire when a justification companion is present, so the benign
+	// high-volume scenarios (CC-01/CC-02/VA-02/VA-05) are excluded. Computed by the
+	// runtime over the real surfaced events, never from the model or the untrusted
+	// transcript text.
+	BulkExportNoJustification bool
+	// BulkExportDetail names the export event + the missing-justification reason for
+	// the audit trail. Empty when BulkExportNoJustification is false.
+	BulkExportDetail string
 }
 
 // hasPerToolText reports whether any per-tool transcript field is populated. When
@@ -408,6 +428,29 @@ func resolveFindingInner(ctx context.Context, client Client, f finding.Finding, 
 				}
 				return escalate(ctx, client, f, opts, triageStage,
 					"observable safety floor [never-auto-resolve: privilege/role-grant]: "+detail+"; the model proposed resolve but a privilege change always escalates: "+triage.reason)
+			}
+
+			// FIX 4 (TERMINAL, action-keyed): an UNJUSTIFIED BULK / PII / SECRET EXPORT
+			// by the finding actor always escalates — the discriminator the relationship
+			// predicates CANNOT see. URA-03 (admin's first-ever 15,000-row pg_dump) and
+			// URA-04 (benign sibling maintenance) hold the SAME group-level relationship
+			// (admin owns the atom-rg group key, count 156); the group-credit treats both
+			// as "established", so a relationship-based predicate cannot tell the exfil
+			// from the maintenance. The ACTION is the discriminator: a high-volume read /
+			// PII export with NO legitimate-justification companion is a data-exfiltration
+			// indicator regardless of how established the actor is. The justification
+			// exclusion (job_id / schedule / scheduled / ticket_id / maintenance_window /
+			// window_id in ANY finding event) keeps the benign high-volume scenarios
+			// (CC-01/CC-02/VA-02/VA-05 — all carry a justification companion) from
+			// tripping. Keyed on the EVENT/ACTION the runner observed, never on the model
+			// reply or the untrusted transcript — verdict isolation holds.
+			if triage.bulkExportNoJustification {
+				detail := triage.bulkExportDetail
+				if detail == "" {
+					detail = "the finding actor performed an unjustified bulk/PII export"
+				}
+				return escalate(ctx, client, f, opts, triageStage,
+					"observable safety floor [never-auto-resolve: unjustified bulk/PII export]: "+detail+"; the model proposed resolve but an unexplained bulk export always escalates: "+triage.reason)
 			}
 
 			// FIX 2 (risky proposed-resolve) AND FIX 3 zero-history both HAND OFF to

@@ -749,3 +749,216 @@ func TestRelationshipCountFor_GroupCreditDiscriminator(t *testing.T) {
 		t.Fatalf("group credit must not cross into a group the actor never touched; got %d want 0", got)
 	}
 }
+
+// --- FIX 4: unjustified bulk / PII export floor (the regression veracity caught) ---
+
+// TestScenarioToolRunner_Fix4_BulkExportPredicate unit-tests the observable predicate
+// directly over RunTools: URA-03 (15,000-row pg_dump), ND-01 (2am PII export, no
+// ticket), and IT-03 (312-op subscription sweep, no justification) MUST trip the
+// bulk-export floor; the four benign high-volume scenarios (CC-01/CC-02/VA-02/VA-05)
+// MUST NOT, because each carries a legitimate-justification companion (job_id /
+// schedule / scheduled / window_id). URA-04/UT-07 (no export signal) and URA-02/VA-03
+// (recon/exfil but no operation_count/export metadata + non-matching list_* actions)
+// MUST NOT trip — so the bulk-export floor never steals URA-02/VA-03's zero-history
+// route. This is the discriminator the relationship predicate cannot see: URA-03 and
+// URA-04 hold the SAME atom-rg group key — the ACTION is what tells them apart.
+func TestScenarioToolRunner_Fix4_BulkExportPredicate(t *testing.T) {
+	root := repoRootForTest(t)
+	defer SetRepoRootForTest("")
+
+	cases := []struct {
+		rel  string
+		want bool
+	}{
+		// Floor FIRES: unjustified bulk / PII / secret export by the finding actor.
+		{"behavioral/URA-03-admin-new-resource.yaml", true},                       // 15,000-row pg_dump, no justification
+		{"cross_cutting/ND-01-authorized-data-export.yaml", true},                 // operation_count=100 + includes_pii=true, no ticket
+		{"cross_cutting/IT-03-connector-tool-suspicious-but-resolved.yaml", true}, // operation_count=312, no justification
+		// Floor does NOT fire: benign high-volume with a justification companion.
+		{"cross_cutting/CC-01-quarterly-report-multi-signal.yaml", false}, // job_id + schedule
+		{"cross_cutting/CC-02-deploy-window-multi-signal.yaml", false},    // window_id (NOT job_id/schedule)
+		{"behavioral/VA-02-month-end-batch.yaml", false},                  // job_id + scheduled=true
+		{"behavioral/VA-05-quarterly-report-burst.yaml", false},           // job_id + schedule
+		// Floor does NOT fire: no export signal at all (resolve via group-credit).
+		{"behavioral/URA-04-sibling-resource-rotation.yaml", false},
+		{"behavioral/UT-07-deploy-window-ops.yaml", false},
+		// Floor does NOT fire: recon/exfil with no bulk metadata + non-matching actions
+		// — these keep their zero-history escalate route, the floor must not steal it.
+		{"behavioral/URA-02-lateral-movement.yaml", false},
+		{"behavioral/VA-03-data-exfil.yaml", false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.rel, func(t *testing.T) {
+			ls := loadScenarioForTest(t, root, tc.rel)
+			r, err := newScenarioToolRunner(t.TempDir(), root, ls.Scenario)
+			if err != nil {
+				t.Fatalf("new runner: %v", err)
+			}
+			ev, err := r.RunTools(context.Background(), "triage", findingFromScenario(ls.Scenario))
+			if err != nil {
+				t.Fatalf("RunTools: %v", err)
+			}
+			if ev.BulkExportNoJustification != tc.want {
+				t.Fatalf("%s: BulkExportNoJustification=%t want %t (detail=%q)\nevents=%q", tc.rel, ev.BulkExportNoJustification, tc.want, ev.BulkExportDetail, ev.EventsText)
+			}
+		})
+	}
+}
+
+// TestRunScenario_Fix4_BulkExport_TerminalEscalate proves the bulk-export floor is a
+// TERMINAL escalate end-to-end: even when the MODEL always proposes a clean resolve,
+// URA-03 / ND-01 / IT-03 escalate at triage on the action-keyed floor. This restores
+// URA-03's floor (lost in b6b7fa8 when the group-credit treated the first-ever
+// pg_dump as "established") and deterministically catches ND-01 / IT-03.
+func TestRunScenario_Fix4_BulkExport_TerminalEscalate(t *testing.T) {
+	root := repoRootForTest(t)
+	defer SetRepoRootForTest("")
+	agent.SetRepoRootForTest(root)
+	defer agent.SetRepoRootForTest("")
+
+	be := newResolveScriptBackend(t) // model ALWAYS proposes resolve
+	for _, rel := range []string{
+		"behavioral/URA-03-admin-new-resource.yaml",
+		"cross_cutting/ND-01-authorized-data-export.yaml",
+		"cross_cutting/IT-03-connector-tool-suspicious-but-resolved.yaml",
+	} {
+		rel := rel
+		t.Run(rel, func(t *testing.T) {
+			ls := loadScenarioForTest(t, root, rel)
+			run := RunScenario(context.Background(), be.client(), ls, agent.CascadeOptions{}, true)
+			if run.SeedErr != "" {
+				t.Fatalf("%s seed error: %s", rel, run.SeedErr)
+			}
+			// Against an ALWAYS-RESOLVE model, the only thing that can escalate URA-03 /
+			// ND-01 / IT-03 is a STRUCTURAL floor. They are NOT zero-history (URA-03 is
+			// group-credited; ND-01/IT-03's actor is a known reader) and carry NO role
+			// grant — so the bulk-export floor is the ONLY structural force that applies.
+			// ModelCalls==2 (triage + escalate-formatter) proves it terminated at triage,
+			// not after a deeper-tier handoff.
+			if run.TerminalAction != "escalated" {
+				t.Fatalf("%s: an unjustified bulk/PII export must TERMINAL-escalate even when the model proposes resolve; got %q\nreason: %s", rel, run.TerminalAction, run.TerminalReason)
+			}
+			if run.ModelCalls != 2 {
+				t.Fatalf("%s: the bulk-export floor must terminate at TRIAGE (2 model calls: triage+formatter); got %d calls — escalate was not driven by the triage floor", rel, run.ModelCalls)
+			}
+		})
+	}
+}
+
+// TestRunScenario_Fix4_BenignHighVolume_NotFloorEscalated proves the CRITICAL
+// DISCRIMINATOR: the benign high-volume scenarios (CC-01/CC-02/VA-02/VA-05) are NOT
+// terminal-escalated by the bulk-export floor — each carries a legitimate-
+// justification companion (job_id / schedule / scheduled / window_id) that excludes
+// the floor. A terminal floor escalate here would be the over-escalation regression
+// we forbid. CC-02 is the load-bearing case: it carries window_id, NOT job_id/
+// schedule — the floor's justification set MUST include window_id or CC-02 would trip.
+func TestRunScenario_Fix4_BenignHighVolume_NotFloorEscalated(t *testing.T) {
+	root := repoRootForTest(t)
+	defer SetRepoRootForTest("")
+	agent.SetRepoRootForTest(root)
+	defer agent.SetRepoRootForTest("")
+
+	be := newResolveScriptBackend(t) // model ALWAYS proposes resolve
+	for _, rel := range []string{
+		"cross_cutting/CC-01-quarterly-report-multi-signal.yaml",
+		"cross_cutting/CC-02-deploy-window-multi-signal.yaml",
+		"behavioral/VA-02-month-end-batch.yaml",
+		"behavioral/VA-05-quarterly-report-burst.yaml",
+	} {
+		rel := rel
+		t.Run(rel, func(t *testing.T) {
+			ls := loadScenarioForTest(t, root, rel)
+			run := RunScenario(context.Background(), be.client(), ls, agent.CascadeOptions{}, true)
+			if run.SeedErr != "" {
+				t.Fatalf("%s seed: %s", rel, run.SeedErr)
+			}
+			// The justification companion excludes the floor, so against an always-
+			// resolve model these RESOLVE. A terminal escalate here would be the
+			// over-escalation regression (the bulk-export floor firing on a justified
+			// batch). CC-02 is load-bearing: it carries window_id (NOT job_id/schedule)
+			// — if the floor's justification set omitted window_id, CC-02 would escalate.
+			if run.TerminalAction != "resolved" {
+				t.Fatalf("%s: benign high-volume scenario (justification companion present) must RESOLVE, not be floor-escalated; got %q\nreason: %s", rel, run.TerminalAction, run.TerminalReason)
+			}
+		})
+	}
+}
+
+// TestRunScenario_Fix4_GroupCreditBenign_StillResolves proves the b6b7fa8 group-credit
+// is INTACT: URA-04 (infra-admin sibling rotation) and UT-07 (ops-engineer scheduled
+// cleanup) still RESOLVE — they carry no export signal, so the bulk-export floor does
+// not fire, and the group-credit keeps their sibling access out of zero-history.
+func TestRunScenario_Fix4_GroupCreditBenign_StillResolves(t *testing.T) {
+	root := repoRootForTest(t)
+	defer SetRepoRootForTest("")
+	agent.SetRepoRootForTest(root)
+	defer agent.SetRepoRootForTest("")
+
+	be := newResolveScriptBackend(t)
+	for _, rel := range []string{
+		"behavioral/URA-04-sibling-resource-rotation.yaml",
+		"behavioral/UT-07-deploy-window-ops.yaml",
+	} {
+		rel := rel
+		t.Run(rel, func(t *testing.T) {
+			ls := loadScenarioForTest(t, root, rel)
+			run := RunScenario(context.Background(), be.client(), ls, agent.CascadeOptions{}, true)
+			if run.SeedErr != "" {
+				t.Fatalf("%s seed: %s", rel, run.SeedErr)
+			}
+			if run.TerminalAction != "resolved" {
+				t.Fatalf("%s: benign group-credit scenario must RESOLVE (group-credit intact, no export floor); got %q\nreason: %s", rel, run.TerminalAction, run.TerminalReason)
+			}
+		})
+	}
+}
+
+// TestRunScenario_Fix4_ZeroHistory_RouteUnchanged proves the bulk-export floor does
+// NOT steal the zero-history route: URA-02 (lateral movement) and VA-03 (data exfil)
+// carry no bulk metadata and their list_*/read_blob actions do not match the bulk
+// action set, so the bulk-export floor stays silent (proven directly in
+// TestScenarioToolRunner_Fix4_BulkExportPredicate) and they still escalate via the
+// zero-history predicate's investigate handoff. Driven with an escalate backend (the
+// model escalates at investigate), they end escalated — the unchanged route.
+func TestRunScenario_Fix4_ZeroHistory_RouteUnchanged(t *testing.T) {
+	root := repoRootForTest(t)
+	defer SetRepoRootForTest("")
+	agent.SetRepoRootForTest(root)
+	defer agent.SetRepoRootForTest("")
+
+	for _, rel := range []string{
+		"behavioral/URA-02-lateral-movement.yaml",
+		"behavioral/VA-03-data-exfil.yaml",
+	} {
+		rel := rel
+		t.Run(rel, func(t *testing.T) {
+			// Confirm the bulk-export floor is silent on these (it must not steal the
+			// zero-history route), then confirm the zero-history route still escalates.
+			ls := loadScenarioForTest(t, root, rel)
+			r, err := newScenarioToolRunner(t.TempDir(), root, ls.Scenario)
+			if err != nil {
+				t.Fatalf("new runner: %v", err)
+			}
+			ev, err := r.RunTools(context.Background(), "triage", findingFromScenario(ls.Scenario))
+			if err != nil {
+				t.Fatalf("RunTools: %v", err)
+			}
+			if ev.BulkExportNoJustification {
+				t.Fatalf("%s: the bulk-export floor must NOT fire here (no bulk metadata / non-matching actions); detail=%q", rel, ev.BulkExportDetail)
+			}
+			if !ev.ZeroHistoryAccess {
+				t.Fatalf("%s: the zero-history predicate must still fire (the existing escalate route); events=%q", rel, ev.EventsText)
+			}
+
+			be := newRecordingHTTPBackend(t) // escalate verdict at every tier
+			run := RunScenario(context.Background(), be.client(), ls, agent.CascadeOptions{}, true)
+			if run.SeedErr != "" {
+				t.Fatalf("%s seed: %s", rel, run.SeedErr)
+			}
+			if run.TerminalAction != "escalated" {
+				t.Fatalf("%s: must still escalate via the zero-history route; got %q\nreason: %s", rel, run.TerminalAction, run.TerminalReason)
+			}
+		})
+	}
+}

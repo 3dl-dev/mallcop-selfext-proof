@@ -98,21 +98,36 @@ type EventView struct {
 // discriminatingMetaKeys are the per-event payload metadata fields projected into
 // EventView.Metadata (FIX 1). They are the OBSERVABLE discriminators the model
 // needs to weigh: VOLUME magnitude (operation_count / blobs_accessed / bytes_read
-// / resource_count) tells a 847-call exfil read apart from a 2-call benign read;
-// ORIGIN (ip / location) tells a familiar-IP session apart from a foreign one;
-// GRANT shape (principal_id / role) tells WHO a role was granted to and at what
-// privilege. Only these keys are surfaced (the schema stays flat + fixed); every
-// other payload field is omitted, exactly as the rest of the projection is.
+// / resource_count / rows_affected) tells a 847-call exfil read apart from a 2-call
+// benign read; EXPORT shape (export_format / includes_pii) marks a bulk PII/secret
+// extraction; ORIGIN (ip / location) tells a familiar-IP session apart from a
+// foreign one; GRANT shape (principal_id / role) tells WHO a role was granted to and
+// at what privilege; JUSTIFICATION (job_id / ticket_id / schedule / scheduled /
+// maintenance_window / window_id / post_deploy) is the legitimate-operation companion
+// that tells a scheduled batch apart from an unexplained bulk export — the
+// discriminator the bulk-export floor (core/eval) keys on. Only these keys are
+// surfaced (the schema stays flat + fixed); every other payload field is omitted,
+// exactly as the rest of the projection is.
 var discriminatingMetaKeys = []string{
 	"operation_count",
 	"blobs_accessed",
 	"bytes_read",
 	"resource_count",
+	"rows_affected",
+	"export_format",
+	"includes_pii",
 	"ip",
 	"location",
 	"principal_id",
 	"role",
 	"user_agent",
+	"job_id",
+	"ticket_id",
+	"schedule",
+	"scheduled",
+	"maintenance_window",
+	"window_id",
+	"post_deploy",
 }
 
 // eventViewFieldCap bounds a single projected EventView string. It matches the

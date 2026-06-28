@@ -42,6 +42,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -127,15 +128,18 @@ type scenarioSnapshot struct {
 	// no events. An empty read is data, not a dismissal (§3.4 / §2.5).
 	searchEmpty bool
 
-	// The two observable force-escalate predicates (§4.3), computed ONCE over the
+	// The observable force-escalate predicates (§4.3), computed ONCE over the
 	// frozen events + the typed baseline. roleGrant terminal-escalates a privilege
 	// grant by the finding actor with no precedent; zeroHist hands a zero-history
-	// access to investigate. Frozen here so every RunTools call returns the same
-	// force regardless of which goroutine runs it.
+	// access to investigate; bulkExport terminal-escalates an unjustified bulk/PII
+	// export. Frozen here so every RunTools call returns the same force regardless
+	// of which goroutine runs it.
 	zeroHist   bool
 	zeroDetail string
 	roleGrant  bool
 	roleDetail string
+	bulkExport bool
+	bulkDetail string
 }
 
 // newScenarioToolRunner builds a live ToolRunner over one scenario's telemetry.
@@ -219,9 +223,10 @@ func (r *scenarioToolRunner) seedSnapshot(st *store.Store, repoRoot string, f fi
 	snap.matchedRules = env.MatchedRules
 	snap.searchEmpty = len(env.Events) == 0
 
-	// --- the two observable forces, computed ONCE over the frozen events. -------
+	// --- the observable forces, computed ONCE over the frozen events. -----------
 	snap.zeroHist, snap.zeroDetail = r.zeroHistoryAccess(snap.events)
 	snap.roleGrant, snap.roleDetail = r.roleGrantByActor(snap.events)
+	snap.bulkExport, snap.bulkDetail = r.bulkExportNoJustification(snap.events)
 
 	// --- search-findings (investigate tier renders this; read once). ------------
 	if fs, fErr := tools.SearchFindings(st, tools.SearchFindingsInput{Actor: r.actor}); fErr == nil {
@@ -309,10 +314,12 @@ func (r *scenarioToolRunner) RunTools(ctx context.Context, tier string, f findin
 		// FIX 3 (OBSERVABLE FORCE-ESCALATE, event-keyed): the two structural
 		// predicates, computed ONCE in seedSnapshot over the REAL surfaced events +
 		// the typed baseline (never the model). Returned identically on every call.
-		ZeroHistoryAccess: r.snap.zeroHist,
-		ZeroHistoryDetail: r.snap.zeroDetail,
-		RoleGrantByActor:  r.snap.roleGrant,
-		RoleGrantDetail:   r.snap.roleDetail,
+		ZeroHistoryAccess:         r.snap.zeroHist,
+		ZeroHistoryDetail:         r.snap.zeroDetail,
+		RoleGrantByActor:          r.snap.roleGrant,
+		RoleGrantDetail:           r.snap.roleDetail,
+		BulkExportNoJustification: r.snap.bulkExport,
+		BulkExportDetail:          r.snap.bulkDetail,
 	}, nil
 }
 
@@ -659,6 +666,162 @@ func (r *scenarioToolRunner) actorRoleGrantFrequency() int {
 	return total
 }
 
+// --- FIX 4 (OBSERVABLE FORCE-ESCALATE): unjustified bulk / PII export. ---------
+//
+// THE DEFECT THIS CLOSES (the regression veracity caught in b6b7fa8): the
+// group-credit relationship predicate cannot distinguish URA-04 (benign sibling
+// maintenance, admin owns the atom-rg group-level key count 156) from URA-03
+// (compromised admin's first-ever 15,000-row pg_dump from atom-db-prod, SAME group
+// key). The relationship is identical; the DISCRIMINATOR IS THE ACTION. A
+// high-volume read / PII / secret export with NO legitimate-justification companion
+// is a data-exfiltration indicator regardless of how established the actor's
+// relationship is — so it is keyed on the ACTION the actor performed, never on the
+// relationship and never on the detector family.
+
+// bulkExportOpCountFloor is the operation_count above which a read/export is "bulk".
+// Set below ND-01 (100/101) and IT-03 (312) so both trip, well above any benign
+// per-event count in the corpus (CC-01/CC-02/VA-02/VA-05 carry NO operation_count
+// at all — their high volume is implicit in the finding title, not a per-event
+// field — so this floor cannot reach them even before the justification exclusion).
+const bulkExportOpCountFloor = 50
+
+// bulkExportRowsFloor is the rows_affected above which an export is "bulk". URA-03's
+// pg_dump exports 15000 rows; set far below it and above incidental small reads.
+const bulkExportRowsFloor = 1000
+
+// bulkExportActions are the action / event-type signatures that ARE a bulk read or
+// export on their own (separator-stripped, lower-cased), independent of any volume
+// field — URA-03 export_data / pg_dump, ND-01 list_users / get_user_details,
+// IT-03 list_resources. Compared after stripSep.
+var bulkExportActions = map[string]struct{}{
+	"exportdata":     {},
+	"pgdump":         {},
+	"dumpdata":       {},
+	"bulkexport":     {},
+	"bulkread":       {},
+	"listusers":      {},
+	"getuserdetails": {},
+	"listresources":  {},
+}
+
+// justificationKeys are the legitimate-operation companion fields. ANY surfaced
+// event in the finding carrying a non-empty (or true) value for one of these
+// EXCLUDES the bulk-export floor: a scheduled batch / ticketed maintenance / release
+// window is a coherent operational pattern, not an unexplained export. CC-01/VA-02/
+// VA-05 carry job_id+schedule(+scheduled); CC-02 carries window_id (NOT job_id/
+// schedule — verified, see the test) — so all four benign high-volume scenarios are
+// excluded. The boolean-shaped flags (scheduled / post_deploy / includes_pii is NOT
+// here — pii is a SIGNAL, not a justification) count only when their value is "true".
+var justificationKeys = []string{
+	"job_id",
+	"ticket_id",
+	"schedule",
+	"scheduled",
+	"maintenance_window",
+	"window_id",
+	"post_deploy",
+}
+
+// justificationBoolKeys are the justification fields whose presence counts ONLY when
+// the value is truthy ("true"). A literal scheduled:"false" is not a justification.
+var justificationBoolKeys = map[string]struct{}{
+	"scheduled":   {},
+	"post_deploy": {},
+}
+
+// bulkExportNoJustification (FIX 4) reports whether the surfaced events show a
+// HIGH-VOLUME read / PII / secret export performed by the finding actor with NO
+// legitimate-justification companion event. It is a TERMINAL escalate (the
+// discriminator is the ACTION, model-independent): it restores URA-03's floor and
+// catches ND-01 (2am PII export, no ticket) + IT-03 (bulk subscription sweep, no
+// justification). It does NOT fire when a justification companion is present, so the
+// benign high-volume scenarios (CC-01/CC-02/VA-02/VA-05) are excluded.
+//
+// The justification scan is over ALL surfaced events (not just the bulk event):
+// CC-02's release_started companion carries window_id on a DIFFERENT event than the
+// volume burst, and the doc's "no business justification" test is at the FINDING
+// level — "is there ANY explanation in this finding's events". The bulk-signal scan
+// is restricted to events AUTHORED BY the finding actor (the actor under
+// investigation actually performed the export).
+func (r *scenarioToolRunner) bulkExportNoJustification(events []tools.EventView) (bool, string) {
+	if r.actor == "" {
+		return false, ""
+	}
+	// (1) A justification companion ANYWHERE in the finding's events excludes the
+	// floor — a coherent scheduled/ticketed/release operation, not an unexplained
+	// export. Checked first so a justified batch never escalates here.
+	if eventsCarryJustification(events) {
+		return false, ""
+	}
+	// (2) The finding actor performed a bulk read / PII / secret export.
+	for _, ev := range events {
+		if !strings.EqualFold(ev.Actor, r.actor) {
+			continue
+		}
+		if sig, why := bulkExportSignal(ev); sig {
+			return true, r.actor + " performed " + why + " with no legitimate-justification companion (no schedule/ticket/job/maintenance_window)"
+		}
+	}
+	return false, ""
+}
+
+// eventsCarryJustification reports whether ANY event carries a non-empty
+// legitimate-operation companion field (job_id / ticket_id / schedule /
+// maintenance_window / window_id, or a truthy scheduled / post_deploy). The
+// boolean-shaped flags count only when "true".
+func eventsCarryJustification(events []tools.EventView) bool {
+	for _, ev := range events {
+		for _, k := range justificationKeys {
+			v, ok := ev.Metadata[k]
+			if !ok {
+				continue
+			}
+			v = strings.TrimSpace(v)
+			if v == "" {
+				continue
+			}
+			if _, isBool := justificationBoolKeys[k]; isBool {
+				if !strings.EqualFold(v, "true") {
+					continue
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// bulkExportSignal reports whether ONE event is a high-volume read / PII / secret
+// export, and a short human reason for the audit trail. Signalled by ANY of:
+// operation_count >= floor, rows_affected >= floor, export_format present,
+// includes_pii=true, or a bulk/dump/export action/type. Keyed on the EVENT, never on
+// the detector family.
+func bulkExportSignal(ev tools.EventView) (bool, string) {
+	if v, ok := ev.Metadata["operation_count"]; ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= bulkExportOpCountFloor {
+			return true, "bulk read (operation_count=" + v + ")"
+		}
+	}
+	if v, ok := ev.Metadata["rows_affected"]; ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= bulkExportRowsFloor {
+			return true, "bulk export (rows_affected=" + v + ")"
+		}
+	}
+	if v, ok := ev.Metadata["export_format"]; ok && strings.TrimSpace(v) != "" {
+		return true, "data export (export_format=" + v + ")"
+	}
+	if v, ok := ev.Metadata["includes_pii"]; ok && strings.EqualFold(strings.TrimSpace(v), "true") {
+		return true, "PII export (includes_pii=true)"
+	}
+	if _, ok := bulkExportActions[stripSep(ev.Action)]; ok {
+		return true, "bulk/export action (" + ev.Action + ")"
+	}
+	if _, ok := bulkExportActions[stripSep(ev.Type)]; ok {
+		return true, "bulk/export event (" + ev.Type + ")"
+	}
+	return false, ""
+}
+
 // stripSep lower-cases and removes separators (-, _, space, .) so "role_assignment",
 // "role-assignment", and "Role Assignment" all fold to "roleassignment".
 func stripSep(s string) string {
@@ -775,11 +938,21 @@ var eventMetaRenderOrder = []string{
 	"blobs_accessed",
 	"bytes_read",
 	"resource_count",
+	"rows_affected",
+	"export_format",
+	"includes_pii",
 	"role",
 	"principal_id",
 	"ip",
 	"location",
 	"user_agent",
+	"job_id",
+	"ticket_id",
+	"schedule",
+	"scheduled",
+	"maintenance_window",
+	"window_id",
+	"post_deploy",
 }
 
 // SearchEventsEnvelopeFromSnapshot reconstructs the minimal SearchEventsEnvelope

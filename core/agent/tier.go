@@ -72,6 +72,13 @@ type tierResult struct {
 	roleGrantByActor  bool
 	roleGrantDetail   string
 
+	// FIX 4 OBSERVABLE FORCE-ESCALATE: an unjustified bulk / PII / secret export by
+	// the finding actor (action-keyed, NOT relationship-keyed) — the discriminator
+	// the group-credit predicate cannot see. Terminal escalate. Computed by the
+	// ToolRunner from the real surfaced events, never the model.
+	bulkExportNoJustification bool
+	bulkExportDetail          string
+
 	// failSafe is true when the tier could not produce a trustworthy verdict
 	// (model error, empty/unparseable reply): the cascade must escalate, never
 	// resolve. reason carries the cause.
@@ -147,6 +154,8 @@ func runTierWithContext(ctx context.Context, client Client, f finding.Finding, t
 	res.zeroHistoryDetail = evidence.ZeroHistoryDetail
 	res.roleGrantByActor = evidence.RoleGrantByActor
 	res.roleGrantDetail = evidence.RoleGrantDetail
+	res.bulkExportNoJustification = evidence.BulkExportNoJustification
+	res.bulkExportDetail = evidence.BulkExportDetail
 
 	// (2) Build the user message. Every attacker-controlled string — the finding's
 	// title/reason/actor/type AND the tool transcript AND any parent transcript —
