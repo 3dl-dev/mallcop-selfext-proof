@@ -132,6 +132,11 @@ func runScan(args []string) error {
 		Store:     st,
 		Baseline:  bl,
 		Workers:   *workers,
+		// Consensus ON by default (safety-first): on every RESOLVE, the gate
+		// re-runs the cascade DefaultConsensusRuns more times and any-escalate-wins.
+		// Validated to cut missed attacks 9→2 on the eval corpus under the
+		// asymmetric error policy (false-negatives catastrophic).
+		Cascade: agent.CascadeOptions{ConsensusRuns: agent.DefaultConsensusRuns},
 	})
 	if err != nil {
 		return fmt.Errorf("scan: %w", err)

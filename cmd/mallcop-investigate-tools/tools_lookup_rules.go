@@ -74,7 +74,7 @@ import (
 // release process pin a corpus that wasn't yet hardcoded). Mismatch in either
 // path returns an error from loadOperatorRules, which surfaces as a
 // resolve-finding gate fire (lookup-rules emits an error result).
-const expectedOperatorRulesSHA256 = "76d2076332601a0335f5795b38ddc99dff19d8c4b03bef88150d10fd96dd046e"
+const expectedOperatorRulesSHA256 = "f1de914f4de7796b695b3978418bab221d5e09db5af946680ce5922dc42bbd89"
 
 // operatorRule is a single rule loaded from operator-decisions.yaml.
 type operatorRule struct {
