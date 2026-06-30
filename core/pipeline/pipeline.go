@@ -170,6 +170,18 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	}
 	findings := detect.Detect(events, bl)
 
+	// OPERATOR FEEDBACK: replay the directives stream and DROP any finding an
+	// operator has suppressed (via `mallcop feedback <id> dismiss`). This is the
+	// keystone that makes persisted feedback honored by the NEXT scan: without
+	// it the directives stream is inert. The drop happens BEFORE the
+	// findings-append below, so a suppressed finding is neither recorded nor
+	// resolved — the operator's decision persists and the next scan obeys it.
+	directives, err := cfg.Store.LoadDirectives()
+	if err != nil {
+		return Summary{}, fmt.Errorf("pipeline: load directives: %w", err)
+	}
+	findings = applyDirectives(findings, directives)
+
 	summary := Summary{
 		EventsScanned:    len(events),
 		FindingsDetected: len(findings),

@@ -19,6 +19,7 @@ import (
 	"github.com/mallcop-app/mallcop/core/toolrun"
 	"github.com/mallcop-app/mallcop/pkg/baseline"
 	"github.com/mallcop-app/mallcop/pkg/finding"
+	"github.com/mallcop-app/mallcop/pkg/notify"
 	"github.com/mallcop-app/mallcop/pkg/resolution"
 )
 
@@ -32,6 +33,10 @@ const (
 	envInferenceKey = "MALLCOP_API_KEY"
 	// envInferenceModel optionally overrides the model id sent on the wire.
 	envInferenceModel = "MALLCOP_MODEL"
+	// envDiscordWebhook GATES the scan→Discord emit. Unset → no emit, scan
+	// behaves exactly as today (no network). Set → escalated findings are posted
+	// to the Discord incoming webhook. No bot token is involved.
+	envDiscordWebhook = "DISCORD_WEBHOOK_URL"
 )
 
 // ScanSummary holds the results of a completed scan cycle.
@@ -172,6 +177,23 @@ func runScan(args []string) error {
 		return fmt.Errorf("scan: %w", err)
 	}
 
+	// (4.5) GATED Discord emit: when DISCORD_WEBHOOK_URL is set, post the
+	// ESCALATED findings to Discord. With the var unset this whole block is
+	// skipped and scan behaves exactly as before — no network, no token. We read
+	// the resolutions this scan just wrote back from the store and emit the
+	// escalated ones through the shared pkg/notify send path.
+	if webhook := os.Getenv(envDiscordWebhook); webhook != "" {
+		escalated, derr := loadEscalatedResolutions(st, sum.FindingsDetected)
+		if derr != nil {
+			return fmt.Errorf("scan: read resolutions for Discord emit: %w", derr)
+		}
+		if err := notify.EmitEscalations(ctx, webhook, escalated); err != nil {
+			// A notification failure must not fail the scan (the findings are
+			// already durably stored); surface it on stderr and continue.
+			fmt.Fprintf(os.Stderr, "scan: discord emit: %v\n", err)
+		}
+	}
+
 	out := ScanSummary{
 		EventsScanned:    sum.EventsScanned,
 		FindingsDetected: sum.FindingsDetected,
@@ -220,6 +242,39 @@ func openOrInitStore(path string) (*store.Store, error) {
 		return nil, fmt.Errorf("scan: open store %q: %w", path, err)
 	}
 	return st, nil
+}
+
+// loadEscalatedResolutions reads the resolutions stream and returns the
+// escalated resolutions written by THIS scan. The pipeline appends exactly one
+// resolution per kept finding (FindingsDetected of them, after suppression), in
+// append order, so the LAST `thisRun` resolutions are this scan's. Of those, the
+// ones with Action=="escalate" are returned for the gated Discord emit.
+//
+// This keeps the pipeline's return signature unchanged: the durable store is the
+// one brain, and the scan reads its own just-written output back from it.
+func loadEscalatedResolutions(st *store.Store, thisRun int) ([]resolution.Resolution, error) {
+	if thisRun <= 0 {
+		return nil, nil
+	}
+	raws, err := st.Load(store.KindResolutions)
+	if err != nil {
+		return nil, err
+	}
+	start := len(raws) - thisRun
+	if start < 0 {
+		start = 0
+	}
+	var out []resolution.Resolution
+	for _, raw := range raws[start:] {
+		var r resolution.Resolution
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return nil, fmt.Errorf("decode resolution: %w", err)
+		}
+		if r.Action == "escalate" {
+			out = append(out, r)
+		}
+	}
+	return out, nil
 }
 
 // errFindings is returned by runScan when findings are present (exit code 1).

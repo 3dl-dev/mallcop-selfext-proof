@@ -39,6 +39,8 @@ func main() {
 		err = runStatus(args)
 	case "config":
 		err = runConfig(args)
+	case "feedback":
+		err = runFeedback(args)
 	default:
 		fmt.Fprintf(os.Stderr, "mallcop: unknown command %q\n\n", cmd)
 		usage()
@@ -83,6 +85,14 @@ Commands:
     --store    Path to the git-repo store written by 'mallcop scan' (required)
 
   config  Print the effective scan config resolved from the environment
+
+  feedback  Record an operator decision on a finding; the next scan honors it
+    <finding_id> approve|dismiss   approve = activity known-good; dismiss = not actionable
+    --store    Path to the git-repo store written by 'mallcop scan' (required)
+    --reason   Operator rationale (free text, recorded for audit)
+    --by       Operator identity (defaults to $USER)
+               Both verbs persist a 'suppress' directive keyed on the finding's
+               source/type/actor, so future findings of that class are dropped.
 
 Exit codes (scan):
   0  No findings
