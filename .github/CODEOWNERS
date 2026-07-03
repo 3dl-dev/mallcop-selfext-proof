@@ -1,0 +1,37 @@
+# CODEOWNERS — the agent-unreachable freeze for mallcop's self-extension
+# contribute-back boundary (rd mallcoppro-71c · design W5).
+#
+# Every path below requires review from the maintainers team before merge. This
+# is the CONTROL-PLANE half of the grader-integrity boundary: the guard's
+# static default-deny is defense-in-depth; this file is the hard gate that a
+# self-extension proposal (or any PR) cannot route around, because a runner
+# with `contents: read` and no secrets cannot approve or merge.
+#
+# SETUP (required — see the PR body): the placeholder team
+# @mallcop-app/maintainers must exist and have write access to the repo, and
+# branch protection must enable "Require review from Code Owners" (plus the
+# `exam gate` required status checks) for this file to be load-bearing.
+# Replace the placeholder with the real maintainers team/handles.
+
+# The committee and its knobs — the consensus the loop must never bypass
+# (invariant #1). NEVER a force-escalate / resolution-rule edit.
+/core/agent/            @mallcop-app/maintainers
+
+# The eval interlock — the grader itself + the corpus loader (rd 71c: out of
+# the agent's reach). A change here could rewrite the number that judges every
+# proposal.
+/core/eval/             @mallcop-app/maintainers
+
+# The free-tier gate: the invariant guard + validate-proposal stack. This is
+# the judge; freezing it is the whole point.
+/core/selfgate/         @mallcop-app/maintainers
+
+# The labeled scenario corpus. Paired with the corpus.pin sha interlock — a
+# scenario change needs a pin update (or exam-detect goes RED) AND maintainer
+# review here.
+/exams/scenarios/       @mallcop-app/maintainers
+
+# CI + repo automation, including exam.yml itself. Freezing .github means the
+# required-check workflow cannot be weakened by a PR (belt to the guard, which
+# already default-denies any .github edit in an authored proposal).
+/.github/               @mallcop-app/maintainers
