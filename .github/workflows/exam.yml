@@ -1,0 +1,164 @@
+# exam.yml — the REQUIRED merge check for mallcop's self-extension
+# contribute-back boundary (rd mallcoppro-71c · design W5).
+#
+# This is the AGENT-UNREACHABLE grader that gates any authored change. The
+# whole security argument for the code-authoring escape hatch (invariants #1,
+# #3, #8, #10) rests on the property that a self-extension proposal CANNOT
+# alter the judge that grades it AND CANNOT MERGE without clearing it. Three
+# structural facts make that true here:
+#
+#   1. `on: pull_request` (NOT pull_request_target) + `permissions: contents:
+#      read` + NO secrets: a contribute-back PR is an external fork PR, so its
+#      job runs with a READ-ONLY token and no secret access. Even a maliciously
+#      EDITED copy of this workflow (a `pull_request` job runs the PR head's
+#      workflow) gains nothing — it cannot push, open a PR, merge, or
+#      exfiltrate a credential. Merge is a control-plane act, not a job the
+#      runner can perform.
+#   2. `.github/` (this file), the grader logic (core/eval, core/selfgate) and
+#      the corpus (exams/scenarios) are CODEOWNERS-frozen to maintainers — and
+#      the guard (below) default-denies any `.github` edit in an authored
+#      proposal. So the gate cannot be WEAKENED INTO `main` without maintainer
+#      review, regardless of what a PR runner does. This is the load-bearing
+#      integrity boundary (control-plane, outside the runner's reach).
+#   3. The strict authored-change judge (`validate-proposal`) is built from the
+#      BASE ref, never the PR tree (E5/E8) — a tampered head cannot subvert the
+#      binary that judges it in-job.
+#
+# CODEOWNERS (.github/CODEOWNERS) freezes core/agent, core/eval, core/selfgate,
+# exams/scenarios and .github to maintainers, so this workflow, the grader
+# logic, and the corpus cannot be weakened without maintainer review — the
+# belt to the guard's default-deny.
+#
+# BRANCH PROTECTION (manual, one-time — see PR body): both required status
+# checks below must be marked "Required" on the protected branch, together with
+# "Require review from Code Owners". Only then is the gate load-bearing.
+
+name: exam gate
+
+on:
+  pull_request:
+
+# Least privilege — the grader-integrity boundary. Read-only, no write scope,
+# no secrets consumed anywhere in this file.
+permissions:
+  contents: read
+
+concurrency:
+  group: exam-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Tier 1 — runs on EVERY PR. Corpus integrity (the corpus.pin sha interlock).
+  # exam-detect loads the HEAD corpus through the sha-pinned interlock
+  # (core/eval/corpus.go — count + sha256 verified on every Load). Its exit
+  # contract (cmd/mallcop/examdetect.go): 0 = all labeled pass, 1 = detection
+  # findings (OPEN GAPS — expected on main; VA-03/PE-08 are the loop's targets),
+  # 2 = OPERATIONAL failure incl. a corpus.pin count/sha mismatch. So a scenario
+  # added/edited without updating exams/scenarios/corpus.pin makes eval.Load
+  # error (exit 2) => this required check goes RED, while the pre-existing open
+  # gaps (exit 1) do NOT block merge. Detector no-regression for ordinary PRs is
+  # covered by ci.yml's `go test ./...`; the authored-lane no-regression /
+  # coverage-+1 contract is the selfext-guard job below.
+  #
+  # NB: RepoRoot() walks up from os.Executable() (core/eval/reporoot.go), NOT
+  # from cwd — so the binary is built INTO the workspace (not `go run`, whose
+  # temp binary cannot resolve exams/scenarios).
+  # ---------------------------------------------------------------------------
+  exam-detect:
+    name: exam-detect (corpus integrity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned Go toolchain
+        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+        with:
+          go-version: '1.25.0'
+          check-latest: false
+
+      - name: Build (the PR tree compiles) + the exam binary in-workspace
+        run: |
+          set -euo pipefail
+          go build ./...
+          go build -o "$GITHUB_WORKSPACE/mallcop" ./cmd/mallcop
+
+      - name: exam-detect — corpus.pin interlock (drift => RED)
+        # Deterministic, offline, LLM-free, $0. Gate on exit 2 (corpus integrity
+        # / operational). Exit 1 = pre-existing open detection gaps, not a merge
+        # blocker; exit 0 = all labeled pass.
+        run: |
+          set +e
+          "$GITHUB_WORKSPACE/mallcop" exam-detect
+          code=$?
+          set -e
+          if [ "$code" -eq 2 ]; then
+            echo "::error::exam-detect exit 2 — corpus integrity / operational failure (corpus.pin count/sha drift?). Update exams/scenarios/corpus.pin in the same change."
+            exit 1
+          fi
+          echo "corpus loaded and graded through the corpus.pin interlock (exit $code); open detection gaps (exit 1) are the loop's targets, not merge blockers."
+
+  # ---------------------------------------------------------------------------
+  # Tier 2 — the STRICT authored-change gate. Runs ONLY for the self-extension
+  # lane (branches opencode opens: `selfext/proposal-*`, or a PR labeled
+  # `selfext/proposal`). The guard default-denies ANY Go edit outside
+  # core/detect/authored/<name>/ and rejects any touch of core/agent, core/eval,
+  # core/selfgate or .github — so it CANNOT be a hard check on ordinary
+  # maintainer PRs (they legitimately edit those paths; CODEOWNERS + human
+  # review gate those). Here it gates exactly the agent-authored additive
+  # detector proposals: guard + structural + exam-detect monotonic-widen.
+  # ---------------------------------------------------------------------------
+  selfext-guard:
+    name: selfext authored-change guard
+    if: >-
+      startsWith(github.head_ref, 'selfext/proposal-') ||
+      contains(github.event.pull_request.labels.*.name, 'selfext/proposal')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR (full history — the gate needs base..head)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up pinned Go toolchain
+        uses: actions/setup-go@3041bf56c941b39c61721a86cd11f3bb1338122a # v5.2.0
+        with:
+          go-version: '1.25.0'
+          check-latest: false
+
+      - name: Build the TRUSTED judge from the base ref (never the PR tree — E5/E8)
+        # The judge binary is compiled from the maintainer-reviewed BASE tree, so
+        # a tampered head cannot subvert the binary that judges it. The guard
+        # (run first, below) then proves the ONLY change is an additive detector
+        # under core/detect/authored/<name>/, so the subprocess-isolated head
+        # binary it later builds for exam-detect differs from base by that
+        # detector alone.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+          ( cd "$RUNNER_TEMP/base" && go build -o "$RUNNER_TEMP/judge-mallcop" ./cmd/mallcop )
+
+      - name: validate-proposal — guard + structural + exam-detect (monotonic-widen)
+        # Ordered stages, short-circuit on first failure:
+        #   guard      — default-deny any Go outside the additive lane; reject any
+        #                core/agent | core/eval | core/selfgate | .github edit
+        #                (blocks a force-escalate / coverage-narrowing change).
+        #   structural — materialize the head worktree, `go build ./...`, import
+        #                allow-list over the authored detector tree.
+        #   exam-detect— build base & head OWN binaries in SUBPROCESS ISOLATION;
+        #                enforce no-regression + coverage-+1 + no-new-firings.
+        #                corpus.pin drift in either tree => exit != 0 => RED.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/judge-mallcop" validate-proposal --base "$BASE_SHA" --head "$HEAD_SHA"
