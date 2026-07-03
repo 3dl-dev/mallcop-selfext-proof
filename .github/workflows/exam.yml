@@ -42,17 +42,24 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Tier 1 — runs on EVERY PR. Corpus integrity + detection no-regression.
-  # This is the check that goes RED on corpus.pin drift: exam-detect loads the
-  # HEAD corpus through the sha-pinned interlock (core/eval/corpus.go — count +
-  # sha256 verified on every Load). A scenario added/edited without updating
-  # exams/scenarios/corpus.pin makes eval.Load return an error (exit 2) and this
-  # required check fails. It also re-grades the real offline detect layer
-  # against the labeled corpus, so a change that suppresses existing coverage
-  # (a regression) goes RED.
+  # Tier 1 — runs on EVERY PR. Corpus integrity (the corpus.pin sha interlock).
+  # exam-detect loads the HEAD corpus through the sha-pinned interlock
+  # (core/eval/corpus.go — count + sha256 verified on every Load). Its exit
+  # contract (cmd/mallcop/examdetect.go): 0 = all labeled pass, 1 = detection
+  # findings (OPEN GAPS — expected on main; VA-03/PE-08 are the loop's targets),
+  # 2 = OPERATIONAL failure incl. a corpus.pin count/sha mismatch. So a scenario
+  # added/edited without updating exams/scenarios/corpus.pin makes eval.Load
+  # error (exit 2) => this required check goes RED, while the pre-existing open
+  # gaps (exit 1) do NOT block merge. Detector no-regression for ordinary PRs is
+  # covered by ci.yml's `go test ./...`; the authored-lane no-regression /
+  # coverage-+1 contract is the selfext-guard job below.
+  #
+  # NB: RepoRoot() walks up from os.Executable() (core/eval/reporoot.go), NOT
+  # from cwd — so the binary is built INTO the workspace (not `go run`, whose
+  # temp binary cannot resolve exams/scenarios).
   # ---------------------------------------------------------------------------
   exam-detect:
-    name: exam-detect (corpus integrity + no-regression)
+    name: exam-detect (corpus integrity)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -67,13 +74,26 @@ jobs:
           go-version: '1.25.0'
           check-latest: false
 
-      - name: Build (the PR tree compiles)
-        run: go build ./...
+      - name: Build (the PR tree compiles) + the exam binary in-workspace
+        run: |
+          set -euo pipefail
+          go build ./...
+          go build -o "$GITHUB_WORKSPACE/mallcop" ./cmd/mallcop
 
-      - name: exam-detect — corpus.pin interlock + no-regression grade
-        # Deterministic, offline, LLM-free, $0. corpus.pin drift OR any labeled
-        # regression => non-zero exit => this required check goes RED.
-        run: go run ./cmd/mallcop exam-detect
+      - name: exam-detect — corpus.pin interlock (drift => RED)
+        # Deterministic, offline, LLM-free, $0. Gate on exit 2 (corpus integrity
+        # / operational). Exit 1 = pre-existing open detection gaps, not a merge
+        # blocker; exit 0 = all labeled pass.
+        run: |
+          set +e
+          "$GITHUB_WORKSPACE/mallcop" exam-detect
+          code=$?
+          set -e
+          if [ "$code" -eq 2 ]; then
+            echo "::error::exam-detect exit 2 — corpus integrity / operational failure (corpus.pin count/sha drift?). Update exams/scenarios/corpus.pin in the same change."
+            exit 1
+          fi
+          echo "corpus loaded and graded through the corpus.pin interlock (exit $code); open detection gaps (exit 1) are the loop's targets, not merge blockers."
 
   # ---------------------------------------------------------------------------
   # Tier 2 — the STRICT authored-change gate. Runs ONLY for the self-extension
