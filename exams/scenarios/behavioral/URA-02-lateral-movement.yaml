@@ -145,3 +145,9 @@ expected:
   investigate_must_use_tools: true
   min_investigate_iterations: 2
   min_investigation_quality: 3
+expected_detection:
+  # A known CI account (ci-bot) suddenly touches 5 resource classes it has never
+  # accessed (vm/storage/db/registry/secret) — lateral movement. The
+  # unusual-resource-access family owns never-before-seen resource access.
+  must_fire:
+  - unusual-resource-access

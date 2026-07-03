@@ -114,3 +114,9 @@ expected:
   investigate_must_use_tools: true
   min_investigate_iterations: 1
   min_investigation_quality: 3
+expected_detection:
+  # A log_format_drift event (40% unmatched) plus a log_sequence_gap (149 entries
+  # missing) from a known container app — the signature of post-hoc log tampering.
+  # The log-format-drift family owns the structural-drift signal.
+  must_fire:
+  - log-format-drift

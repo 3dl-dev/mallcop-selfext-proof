@@ -113,3 +113,8 @@ expected:
   investigate_must_use_tools: true
   min_investigate_iterations: 2
   min_investigation_quality: 3
+expected_detection:
+  # A completely unknown actor (ext-user-7f3a, absent from the baseline) enumerates
+  # resources and reads secrets. First-seen actor is the new-actor family's signal.
+  must_fire:
+  - new-actor
