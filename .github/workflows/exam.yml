@@ -4,18 +4,25 @@
 # This is the AGENT-UNREACHABLE grader that gates any authored change. The
 # whole security argument for the code-authoring escape hatch (invariants #1,
 # #3, #8, #10) rests on the property that a self-extension proposal CANNOT
-# alter the judge that grades it. Three structural facts make that true here:
+# alter the judge that grades it AND CANNOT MERGE without clearing it. Three
+# structural facts make that true here:
 #
-#   1. `on: pull_request` (NOT pull_request_target): GitHub evaluates THIS
-#      workflow file from the BASE branch, so the PR's own branch cannot change
-#      what the gate does. The agent authors on its branch; the gate is base's.
-#   2. `permissions: contents: read` + NO secrets: the gate job cannot push,
-#      cannot open a PR, cannot merge, and holds no credential to exfiltrate.
-#      Merge is a control-plane act (branch protection), not a job the runner
-#      can perform.
+#   1. `on: pull_request` (NOT pull_request_target) + `permissions: contents:
+#      read` + NO secrets: a contribute-back PR is an external fork PR, so its
+#      job runs with a READ-ONLY token and no secret access. Even a maliciously
+#      EDITED copy of this workflow (a `pull_request` job runs the PR head's
+#      workflow) gains nothing — it cannot push, open a PR, merge, or
+#      exfiltrate a credential. Merge is a control-plane act, not a job the
+#      runner can perform.
+#   2. `.github/` (this file), the grader logic (core/eval, core/selfgate) and
+#      the corpus (exams/scenarios) are CODEOWNERS-frozen to maintainers — and
+#      the guard (below) default-denies any `.github` edit in an authored
+#      proposal. So the gate cannot be WEAKENED INTO `main` without maintainer
+#      review, regardless of what a PR runner does. This is the load-bearing
+#      integrity boundary (control-plane, outside the runner's reach).
 #   3. The strict authored-change judge (`validate-proposal`) is built from the
 #      BASE ref, never the PR tree (E5/E8) — a tampered head cannot subvert the
-#      binary that judges it.
+#      binary that judges it in-job.
 #
 # CODEOWNERS (.github/CODEOWNERS) freezes core/agent, core/eval, core/selfgate,
 # exams/scenarios and .github to maintainers, so this workflow, the grader
