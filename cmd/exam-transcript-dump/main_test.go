@@ -134,6 +134,51 @@ func TestDump_TrapStuffedInputSanitized(t *testing.T) {
 	}
 }
 
+// TestDump_ExpectedDetectionLeakSanitized verifies that the dumper REFUSES to
+// write a transcript when the expected_detection / ExpectedDetection
+// ground-truth marker (internal/exam's must_fire / must_not_fire block) leaks
+// into rendered output, in either snake_case or CamelCase form.
+//
+// This is a pinning test for the forbidden-substrings list in main.go: it
+// guards against the marker being dropped from the list by a future edit.
+func TestDump_ExpectedDetectionLeakSanitized(t *testing.T) {
+	cases := []struct {
+		name   string
+		marker string
+	}{
+		{name: "snake_case", marker: "expected_detection"},
+		{name: "CamelCase", marker: "ExpectedDetection"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fixtureDir := t.TempDir()
+			transcriptDir := t.TempDir()
+
+			stuffed := cleanEnvelope()
+			stuffed.Finding.Title = tc.marker + ": admin-user created svc"
+
+			writeFixtures(t, fixtureDir, stuffed, cleanBaseline())
+
+			resBytes, _ := json.Marshal(cleanResolutionJSON())
+
+			err := run2("ID-01-new-actor-benign-onboarding", fixtureDir, transcriptDir, string(resBytes))
+
+			if err == nil {
+				t.Fatalf("expected sanitization error on %s leak, got nil", tc.name)
+			}
+			if !strings.Contains(err.Error(), "SANITIZATION FAILURE") {
+				t.Fatalf("expected SANITIZATION FAILURE in error, got: %v", err)
+			}
+
+			outPath := filepath.Join(transcriptDir, "ID-01-new-actor-benign-onboarding.md")
+			if _, statErr := os.Stat(outPath); statErr == nil {
+				t.Fatal("transcript was written despite sanitization failure — file must not exist")
+			}
+		})
+	}
+}
+
 // TestDump_AllEventIDsRendered verifies positive coverage: every event_id from
 // the fixture appears in the rendered transcript. Confirms the dumper is not a
 // no-op and that all events are included in output.
