@@ -544,6 +544,68 @@ func (aliaswrite) Detect(events []event.Event, _ *baseline.Baseline) []finding.F
 `,
 		},
 		{
+			// K7 L3 re-hardening (e), red-team round 7: re-aliasing through a plain
+			// `=` ASSIGN into a pre-declared local (`var local *T; local = bl`)
+			// must derive exactly like `local := bl` — the one-keyword spelling
+			// swap defeated the DEFINE-only fold and nulled the shared baseline
+			// map through the alias.
+			name:    "var-then-assign re-alias of the baseline parameter, then write",
+			dirName: "assignalias",
+			rule:    RuleShapeNonLocalAssign,
+			src: `package assignalias
+
+import (
+	"github.com/mallcop-app/mallcop/core/detect"
+	"github.com/mallcop-app/mallcop/pkg/baseline"
+	"github.com/mallcop-app/mallcop/pkg/event"
+	"github.com/mallcop-app/mallcop/pkg/finding"
+)
+
+func init() { detect.Register(assignalias{}) }
+
+type assignalias struct{}
+
+func (assignalias) Name() string { return "assignalias-detector" }
+
+func (assignalias) Detect(_ []event.Event, bl *baseline.Baseline) []finding.Finding {
+	var local *baseline.Baseline
+	local = bl
+	local.KnownUsers = nil
+	return nil
+}
+`,
+		},
+		{
+			// K7 L3 re-hardening (f), red-team round 7: the `=` ASSIGN spelling of
+			// the builtin-mutator hole — alias a parameter's map into a
+			// pre-declared local, then delete() through it.
+			name:    "var-then-assign alias of the baseline map, then delete()",
+			dirName: "assigndelete",
+			rule:    RuleShapeNonLocalAssign,
+			src: `package assigndelete
+
+import (
+	"github.com/mallcop-app/mallcop/core/detect"
+	"github.com/mallcop-app/mallcop/pkg/baseline"
+	"github.com/mallcop-app/mallcop/pkg/event"
+	"github.com/mallcop-app/mallcop/pkg/finding"
+)
+
+func init() { detect.Register(assigndelete{}) }
+
+type assigndelete struct{}
+
+func (assigndelete) Name() string { return "assigndelete-detector" }
+
+func (assigndelete) Detect(_ []event.Event, bl *baseline.Baseline) []finding.Finding {
+	var m map[string]bool
+	m = bl.KnownUsers
+	delete(m, "x")
+	return nil
+}
+`,
+		},
+		{
 			// K7 L3 re-hardening (d): a transitive alias chain (`a := bl; b := a`)
 			// still resolves to the parameter before the mutation, proving the
 			// fixed-point loop in paramDerivedIdents (not just a single-hop check)

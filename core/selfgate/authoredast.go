@@ -502,17 +502,19 @@ func paramWriteDetail(name string, directParams map[string]bool) string {
 }
 
 // paramDerivedIdents returns params UNIONED with every local identifier that is
-// a simple alias of a parameter (or of a prior alias): a `:=` DEFINE whose
+// a simple alias of a parameter (or of a prior alias): a `:=` DEFINE — or a
+// plain `=` ASSIGN into an identifier (`var local *T; local = bl`) — whose
 // right-hand side is a single expression rooted (via rootIdent) at an
 // already-known parameter-derived identifier. `local := bl`, `local := events`,
-// and the transitive `a := bl; b := a` are all covered. This intentionally does
-// NOT try to prove `local` is used read-only afterward — any local alias of a
-// parameter is treated as parameter-derived for the rest of the function, which
-// is sound (over-approximating "derived from a parameter" can only flag more
-// writes, never miss a real one) and matches the fail-closed posture of the rest
-// of this gate. The fixed-point loop (bounded, since each pass can only grow the
-// set and the set is bounded by the number of identifiers in the function) picks
-// up chains of aliases regardless of source order.
+// `local = bl` after a var declaration, and the transitive `a := bl; b := a`
+// are all covered. Derivation is MONOTONIC: once an identifier is
+// parameter-derived it stays derived for the rest of the function even if
+// later reassigned to something local — never un-deriving is what keeps the
+// over-approximation sound (it can only flag more writes, never miss a real
+// one) and matches the fail-closed posture of the rest of this gate. The
+// fixed-point loop (bounded, since each pass can only grow the set and the set
+// is bounded by the number of identifiers in the function) picks up chains of
+// aliases regardless of source order.
 func paramDerivedIdents(body *ast.BlockStmt, params map[string]bool) map[string]bool {
 	derived := make(map[string]bool, len(params))
 	for name := range params {
@@ -522,7 +524,7 @@ func paramDerivedIdents(body *ast.BlockStmt, params map[string]bool) map[string]
 		grew := false
 		ast.Inspect(body, func(n ast.Node) bool {
 			as, ok := n.(*ast.AssignStmt)
-			if !ok || as.Tok != token.DEFINE || len(as.Lhs) != len(as.Rhs) {
+			if !ok || (as.Tok != token.DEFINE && as.Tok != token.ASSIGN) || len(as.Lhs) != len(as.Rhs) {
 				return true
 			}
 			for i, lhs := range as.Lhs {
