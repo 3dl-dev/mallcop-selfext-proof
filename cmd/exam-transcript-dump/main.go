@@ -43,9 +43,11 @@ var forbidden = []string{
 	"trap_description",
 	"trap_resolved_means",
 	"expected_resolution",
+	"expected_detection",
 	"TrapDescription",
 	"TrapResolvedMeans",
 	"ExpectedResolution",
+	"ExpectedDetection",
 }
 
 // taxonomyCodes are the six failure-mode codes from the exam taxonomy.
