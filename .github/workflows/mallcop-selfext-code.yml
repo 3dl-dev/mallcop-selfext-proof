@@ -46,7 +46,7 @@ jobs:
     # An upgrade is a one-line SHA bump here (or a Dependabot github-actions PR that
     # itself hits CODEOWNERS review). The reusable workflow in turn pins the runner
     # image by @sha256 digest, so the whole supply chain is SHA-locked end to end.
-    uses: mallcop-app/selfext/.github/workflows/selfext-code-reusable.yml@d9d51da47376025fe6033afa414a1298a841d2d8
+    uses: mallcop-app/selfext/.github/workflows/selfext-code-reusable.yml@a5fa6238c28e6faf05020b4c8abbf55adbdef766
     secrets:
       inference_key: ${{ secrets.MALLCOP_SK }}     # the customer's OWN donut key, or a BYOI provider key — never an admin key
       byoi_url: ${{ secrets.INFERENCE_URL }}       # BYOI rail only
